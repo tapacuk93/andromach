@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/sysctl.h>
 #include <time.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 typedef struct { char *b; size_t n, cap; } buf;
@@ -218,26 +219,112 @@ static bool sys_file(buf *o, const char *path) {
     return false;
 }
 
-static bool is_dir(const char *path) {
-    static const char *dirs[] = {"/proc", "/sys", "/sys/fs", "/sys/fs/selinux", "/proc/sys", "/proc/self", NULL};
-    for (const char **d = dirs; *d; d++) if (!strcmp(path, *d)) return true;
+typedef struct { char path[1024]; } tmpdir;
+
+static void tmpdir_release(am_file *f) {
+    tmpdir *t = f->priv;
+    char cmd[1200];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", t->path);
+    if (system(cmd)) {}
+    free(t);
+}
+
+static const am_file_ops tmpdir_ops = {.name = "procfs-dir", .release = tmpdir_release};
+
+typedef struct { const char *dir; } list_ctx;
+
+static void add_pid(am_proc *p, void *arg) {
+    char e[1200];
+    snprintf(e, sizeof e, "%s/%d", ((list_ctx *)arg)->dir, p->pid);
+    mkdir(e, 0555);
+}
+
+// Fills dir with the entries of the /proc directory path; false if path is not one.
+static bool list_dir(const char *path, const char *dir) {
+    char e[1200];
+    if (!strcmp(path, "/proc")) {
+        list_ctx c = {dir};
+        am_proc_for_each(add_pid, &c);
+        const char *files[] = {"self", "thread-self", "cpuinfo", "meminfo", "stat", "uptime", "version", "cmdline",
+                               "filesystems", "mounts", "loadavg", "sys", NULL};
+        for (const char **f = files; *f; f++) {
+            snprintf(e, sizeof e, "%s/%s", dir, *f);
+            if (!strcmp(*f, "sys")) mkdir(e, 0555);
+            else if (!strncmp(*f, "self", 4) || !strncmp(*f, "thread", 6)) { if (symlink("/proc/1", e)) {} }
+            else close(open(e, O_CREAT | O_WRONLY, 0444));
+        }
+        return true;
+    }
+    if (!strcmp(path, "/sys") || !strcmp(path, "/sys/fs") || !strcmp(path, "/sys/fs/selinux") ||
+        !strcmp(path, "/proc/sys")) return true;
     int pid, n = 0;
-    return sscanf(path, "/proc/%d%n", &pid, &n) == 1 && (!path[n] || !strcmp(path + n, "/fd") ||
-                                                          !strcmp(path + n, "/task") || !strcmp(path + n, "/attr"));
+    if (sscanf(path, "/proc/%d%n", &pid, &n) != 1) return false;
+    am_proc *p = pid == am_self->proc->pid ? am_self->proc : am_proc_get(pid);
+    if (!p) return false;
+    const char *rest = path + n;
+    if (!*rest) {
+        const char *files[] = {"cmdline", "comm", "stat", "status", "maps", "smaps", "mounts", "oom_score_adj",
+                               "environ", "cgroup", NULL};
+        for (const char **f = files; *f; f++) {
+            snprintf(e, sizeof e, "%s/%s", dir, *f);
+            close(open(e, O_CREAT | O_WRONLY, 0444));
+        }
+        const char *dirs[] = {"task", "fd", "attr", NULL};
+        for (const char **d = dirs; *d; d++) { snprintf(e, sizeof e, "%s/%s", dir, *d); mkdir(e, 0555); }
+        return true;
+    }
+    if (!strcmp(rest, "/task")) {
+        pthread_mutex_lock(&p->lock);
+        for (am_thread *t = p->threads; t; t = t->next) {
+            snprintf(e, sizeof e, "%s/%d", dir, t->tid);
+            mkdir(e, 0555);
+        }
+        pthread_mutex_unlock(&p->lock);
+        return true;
+    }
+    if (!strcmp(rest, "/fd") || !strcmp(rest, "/fdinfo")) {
+        pthread_mutex_lock(&p->lock);
+        for (int i = 0; i < AM_MAX_FDS; i++)
+            if (p->fds[i]) {
+                snprintf(e, sizeof e, "%s/%d", dir, i);
+                if (symlink(p->fds[i]->gpath ? p->fds[i]->gpath : "anon_inode:[unknown]", e)) {}
+            }
+        pthread_mutex_unlock(&p->lock);
+        return true;
+    }
+    int tid, m = 0;
+    if (sscanf(rest, "/task/%d%n", &tid, &m) == 1 && !rest[m]) {
+        // A thread's directory holds what its process's does.
+        char pp[64];
+        snprintf(pp, sizeof pp, "/proc/%d", p->pid);
+        return list_dir(pp, dir);
+    }
+    if (!strcmp(rest, "/attr")) return true;
+    return false;
+}
+
+static bool open_dir(const char *canon, int lflags, am_file **out, long *err) {
+    tmpdir *t = malloc(sizeof *t);
+    snprintf(t->path, sizeof t->path, "%s/tmp/.procdir-XXXXXX", am_datadir);
+    if (!mkdtemp(t->path)) { free(t); *err = am_errno(errno); return true; }
+    if (!list_dir(canon, t->path)) {
+        rmdir(t->path);
+        free(t);
+        return false;
+    }
+    int fd = open(t->path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) { *err = am_errno(errno); free(t); return true; }
+    *out = am_file_new(fd, lflags, canon, &tmpdir_ops, t);
+    *err = 0;
+    return true;
 }
 
 static bool under_proc(const char *p) { return !strncmp(p, "/proc", 5) && (!p[5] || p[5] == '/'); }
 
 long am_procfs_open(const char *canon, int lflags, am_file **out) {
     char host[4096];
-    if (is_dir(canon)) {
-        // An empty directory stands in; listings of /proc are not modelled.
-        snprintf(host, sizeof host, "%s/proc", am_datadir);
-        int fd = open(host, O_RDONLY | O_CLOEXEC);
-        if (fd < 0) return am_errno(errno);
-        *out = am_file_new(fd, lflags, canon, NULL, NULL);
-        return 0;
-    }
+    long err;
+    if (open_dir(canon, lflags, out, &err)) return err;
     buf o = {0};
     bool found = under_proc(canon) ? proc_file(&o, canon) : sys_file(&o, canon);
     if (!found) { free(o.b); return AM_ERR(LINUX_ENOENT); }

@@ -228,6 +228,7 @@ int am_fd_install(am_proc *p, am_file *f, int min, bool cloexec) {
 }
 
 void am_file_put(am_file *f) {
+    if (!f) return;
     if (__atomic_sub_fetch(&f->refs, 1, __ATOMIC_ACQ_REL)) return;
     am_event_file_gone(f);
     if (f->ops && f->ops->release) f->ops->release(f);
@@ -316,6 +317,13 @@ long am_open(const char *gpath, int dirfd, int lflags, int mode, am_file **out) 
     if (lflags & LINUX_O_PATH) {
         fd = open(host, O_RDONLY | O_CLOEXEC | ((lflags & LINUX_O_NOFOLLOW) ? O_SYMLINK : 0));
         if (fd < 0 && errno == EACCES) fd = open(host, O_SEARCH | O_CLOEXEC);
+        if (fd < 0 && (errno == EOPNOTSUPP || errno == ENXIO)) {
+            // A socket or fifo: an O_PATH fd only names it, so keep the name without a host fd.
+            struct stat st;
+            if (lstat(host, &st)) return am_errno(errno);
+            *out = file_new(-1, lflags, canon);
+            return 0;
+        }
     } else {
         fd = open(host, darwin_oflags(lflags) | O_CLOEXEC, mode & ~am_self->proc->umask);
     }
@@ -391,6 +399,11 @@ static long virtual_stat(const char *canon, struct linux_stat *out) {
 
 static long do_fstat(am_file *f, struct linux_stat *out) {
     struct stat st;
+    if (f->hostfd < 0 && f->gpath) {
+        char host[4096];
+        long r = am_resolve(LINUX_AT_FDCWD, f->gpath, false, host, sizeof host, NULL, 0);
+        return r < 0 ? r : stat_path(host, false, out);
+    }
     if (fstat(f->hostfd, &st)) return am_errno(errno);
     to_linux_stat(out, &st, f->image ? f : NULL);
     return 0;
@@ -577,6 +590,7 @@ static long sys_fcntl(int fd, int cmd, uint64_t arg) {
     case LINUX_F_GETFD: return p->cloexec[fd] ? 1 : 0;
     case LINUX_F_SETFD: p->cloexec[fd] = arg & 1; return 0;
     case LINUX_F_GETFL: {
+        if (f->hostfd < 0) return f->lflags;
         int d = fcntl(f->hostfd, F_GETFL);
         return d < 0 ? am_errno(errno) : lflags_from_darwin(d, f->lflags);
     }
@@ -782,6 +796,10 @@ long sys_fs(am_ctx *c, long nr, bool *handled) {
         return r < 0 ? r : chmod(host, (mode_t)A(2)) ? am_errno(errno) : 0;
     case LINUX_SYS_fchmod:
         if (!(f = am_fd_get((int)A(0)))) return AM_ERR(LINUX_EBADF);
+        if (f->hostfd < 0 && f->gpath) {
+            r = am_resolve(LINUX_AT_FDCWD, f->gpath, false, host, sizeof host, NULL, 0);
+            return r < 0 ? r : chmod(host, (mode_t)A(1)) ? am_errno(errno) : 0;
+        }
         return fchmod(f->hostfd, (mode_t)A(1)) ? am_errno(errno) : 0;
     case LINUX_SYS_fchownat: case LINUX_SYS_fchown:
         return 0;  // one user on the host; ownership is not modelled

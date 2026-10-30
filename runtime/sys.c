@@ -156,6 +156,12 @@ static long sys_misc(am_ctx *c, long nr, bool *handled) {
         case 15: /* PR_SET_NAME */ pthread_setname_np((const char *)A(1)); return 0;
         case 16: /* PR_GET_NAME */ pthread_getname_np(pthread_self(), (char *)A(1), 16); return 0;
         case 0x53564d41: /* PR_SET_VMA */ return 0;
+        // Capabilities: all of them held, up to CAP_LAST_CAP (40); beyond it, EINVAL ends the probes.
+        case 23: /* PR_CAPBSET_READ */ return A(1) <= 40 ? 1 : AM_ERR(LINUX_EINVAL);
+        case 24: /* PR_CAPBSET_DROP */ return A(1) <= 40 ? 0 : AM_ERR(LINUX_EINVAL);
+        case 47: /* PR_CAP_AMBIENT */ return A(2) <= 40 ? 0 : AM_ERR(LINUX_EINVAL);
+        case 3: /* PR_GET_DUMPABLE */ return 1;
+        case 9: /* PR_GET_KEEPCAPS */ return 0;
         case 55: /* PR_SET_TAGGED_ADDR_CTRL */ return AM_ERR(LINUX_EINVAL);
         case 56: /* PR_GET_TAGGED_ADDR_CTRL */ return AM_ERR(LINUX_EINVAL);
         }
