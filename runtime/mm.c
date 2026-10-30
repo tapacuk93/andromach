@@ -66,11 +66,7 @@ static int host_prot(int p) {
 static long do_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, uint64_t off);
 
 long am_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, uint64_t off) {
-    long r = do_mmap(addr, len, prot, flags, fd, off);
-    if (getenv("AM_DEBUG") && am_self && am_self->fork)
-        fprintf(stderr, "fork child mmap %#llx+%#llx flags %#x = %#lx\n", (unsigned long long)addr,
-                (unsigned long long)len, flags, r);
-    return track(r, len, flags);
+    return track(do_mmap(addr, len, prot, flags, fd, off), len, flags);
 }
 
 static long do_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, uint64_t off) {
@@ -151,7 +147,7 @@ long sys_mm(am_ctx *c, long nr, bool *handled) {
     switch (nr) {
     case LINUX_SYS_mmap: return am_mmap(A(0), A(1), (int)A(2), (int)A(3), (int)A(4), A(5));
     case LINUX_SYS_munmap:
-        if (am_self->fork) am_fork_munmap(A(0), A(0) + A(1));
+        if (am_self->proc->mg) am_mg_munmap(A(0), A(0) + A(1));
         else if (munmap((void *)A(0), A(1))) return am_errno(errno);
         am_vma_remove(am_self->proc, A(0), A(0) + A(1));
         return 0;
@@ -182,7 +178,7 @@ long sys_mm(am_ctx *c, long nr, bool *handled) {
             if (mach_vm_remap(mach_task_self(), &to, newsz, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(), old,
                               false, &cur, &max, VM_INHERIT_DEFAULT))
                 return AM_ERR(LINUX_ENOMEM);
-            if (am_self->fork) am_fork_munmap(old, old + oldsz);
+            if (am_self->proc->mg) am_mg_munmap(old, old + oldsz);
             else munmap((void *)old, oldsz);
             am_vma_remove(am_self->proc, old, old + oldsz);
             am_vma_add(am_self->proc, to, to + newsz, !info_private(to));
@@ -190,7 +186,7 @@ long sys_mm(am_ctx *c, long nr, bool *handled) {
         }
         if (newsz <= oldsz) {
             if (newsz < oldsz) {
-                if (am_self->fork) am_fork_munmap(old + newsz, old + oldsz);
+                if (am_self->proc->mg) am_mg_munmap(old + newsz, old + oldsz);
                 else munmap((void *)(old + newsz), oldsz - newsz);
                 am_vma_remove(am_self->proc, old + newsz, old + oldsz);
             }
@@ -216,7 +212,7 @@ long sys_mm(am_ctx *c, long nr, bool *handled) {
             munmap((void *)to, oldsz);
             to = b;
         }
-        if (am_self->fork) am_fork_munmap(old, old + oldsz);
+        if (am_self->proc->mg) am_mg_munmap(old, old + oldsz);
         else munmap((void *)old, oldsz);
         am_vma_remove(am_self->proc, old, old + oldsz);
         am_vma_add(am_self->proc, to, to + newsz, !(info_private(to)));

@@ -99,7 +99,10 @@ static long sys_misc(am_ctx *c, long nr, bool *handled) {
             if (ns <= 0) return 0;
             ts.tv_sec = ns / 1000000000; ts.tv_nsec = ns % 1000000000;
         }
-        return nanosleep(&ts, NULL) ? am_errno(errno) : 0;
+        am_block_begin();
+        int sr = nanosleep(&ts, NULL);
+        am_block_end();
+        return sr ? am_errno(errno) : 0;
     }
     case LINUX_SYS_getrandom: arc4random_buf((void *)A(0), A(1)); return A(1);
     case LINUX_SYS_sched_yield: sched_yield(); return 0;
@@ -238,6 +241,7 @@ void am_syscall(am_ctx *c, int from_trap) {
     c->x[0] = (uint64_t)r;
     bool replaced = c->pc != entry_pc_sp.pc || c->sp != entry_pc_sp.sp;  // rt_sigreturn, vfork stack
     if (am_signal_deliver(c)) replaced = true;
+    if (t->proc->mg) am_mg_yield();
     t->in_runtime = 0;
     // A stub returns through its own epilogue, which can only resume where it was called from;
     // anything else needs the full context switch.

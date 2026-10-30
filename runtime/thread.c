@@ -27,7 +27,9 @@ static long futex_wait(uint32_t *addr, uint32_t val, const struct linux_timespec
     if (__atomic_load_n(addr, __ATOMIC_SEQ_CST) != val) return AM_ERR(LINUX_EAGAIN);
     int r;
     if (!ts) {
+        am_block_begin();
         r = os_sync_wait_on_address(addr, val, 4, OS_SYNC_WAIT_ON_ADDRESS_NONE);
+        am_block_end();
     } else {
         uint64_t ns = (uint64_t)ts->tv_sec * 1000000000ull + ts->tv_nsec;
         if (absolute) {
@@ -36,8 +38,10 @@ static long futex_wait(uint32_t *addr, uint32_t val, const struct linux_timespec
             ns -= now;
         }
         if (!ns) return AM_ERR(LINUX_ETIMEDOUT);
+        am_block_begin();
         r = os_sync_wait_on_address_with_timeout(addr, val, 4, OS_SYNC_WAIT_ON_ADDRESS_NONE,
                                                  OS_CLOCK_MACH_ABSOLUTE_TIME, ns);
+        am_block_end();
     }
     if (r >= 0) return 0;
     if (errno == ETIMEDOUT) return AM_ERR(LINUX_ETIMEDOUT);
@@ -190,6 +194,9 @@ static void *thread_main(void *arg) {
     free(arg);
     am_self = a.t;
     am_thread_tsd_init(a.tls);
+    am_mg_acquire();  // a member of a memory group runs only with its pages in place
+    if (a.t->start_settid) *(int *)a.t->start_settid = a.t->tid;
+    a.t->start_settid = 0;
     am_resume(&a.ctx);
 }
 
@@ -216,6 +223,7 @@ void am_thread_exit_tail(void *arg) {
         am_futex_wake((uint32_t *)t->clear_child_tid, 1);
     }
     am_proc *p = t->proc;
+    am_mg_release();
     int left = thread_unlink(t);
     am_self = NULL;
     am_thread_free(t);

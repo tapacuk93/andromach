@@ -215,7 +215,9 @@ static bool nonblocking(am_file *f, int lflags) {
 
 static void wait_fd(int fd, short ev) {
     struct pollfd p = {fd, ev, 0};
+    am_block_begin();
     while (poll(&p, 1, -1) < 0 && errno == EINTR) {}
+    am_block_end();
 }
 
 bool am_sock_peer_gone(am_file *f) {
@@ -1486,7 +1488,17 @@ static long do_getsockopt(int fd, int level, int opt, void *val, uint32_t *len) 
             *len = sizeof u;
             return 0;
         }
-        case L_SO_PEERSEC: return AM_ERR(LINUX_ENOPROTOOPT);
+        case L_SO_PEERSEC: {
+            // The peer's SELinux label. There is one label for everything (see procfs.c);
+            // init's property service refuses requests it cannot label.
+            static const char label[] = "u:r:su:s0";
+            if (s->family != L_AF_UNIX) return AM_ERR(LINUX_ENOPROTOOPT);
+            if (!len) return AM_ERR(LINUX_EFAULT);
+            if (*len < sizeof label) { *len = sizeof label; return AM_ERR(LINUX_ERANGE); }
+            memcpy(val, label, sizeof label);
+            *len = sizeof label;
+            return 0;
+        }
         case L_SO_ERROR:
             if (s->family == L_AF_UNIX || s->family == L_AF_NETLINK) return put_int(val, len, 0);
             break;

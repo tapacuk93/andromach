@@ -105,143 +105,45 @@ static void close_all_fds(am_proc *p, bool only_cloexec) {
 }
 
 // ---- fork --------------------------------------------------------------------------------
-typedef struct { uint64_t addr, size, copy; int prot; } snapshot;
-
-struct am_fork {
-    am_thread *parent;
-    am_ctx ctx;               // the parent's state at the fork; resumed with x0 = child pid
-    uint64_t tp;              // the parent's guest thread pointer
-    uint64_t parent_tid_ptr;  // CLONE_PARENT_SETTID, written once the parent's memory is back
-    snapshot *snaps;
-    int nsnaps;
-    am_vma *old;              // the child's ranges from before its exec, released at the end
-    int nold;
-    am_thread *exec_thread;   // the child's new program, started once the parent's memory is back
-    am_ctx exec_ctx;
-};
-
-static void snapshot_memory(am_proc *p, am_fork *fk) {
-    pthread_mutex_lock(&p->vm_lock);
-    int cap = 64;
-    fk->snaps = calloc(cap, sizeof *fk->snaps);
-    for (int i = 0; i < p->nvma; i++) {
-        am_vma *v = &p->vmas[i];
-        if (v->shared) continue;
-        // One copy per kernel map entry, so each keeps its own protection (RELRO next to data).
-        mach_vm_address_t a = v->start;
-        while (a < v->end) {
-            mach_vm_address_t r = a;
-            mach_vm_size_t sz;
-            vm_region_basic_info_data_64_t info;
-            mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
-            mach_port_t obj;
-            if (mach_vm_region(mach_task_self(), &r, &sz, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &cnt, &obj))
-                break;
-            if (r >= v->end) break;
-            uint64_t s0 = r > a ? r : a, e0 = r + sz < v->end ? r + sz : v->end;
-            a = e0;
-            if (info.protection & VM_PROT_EXECUTE) continue;  // code never changes
-            mach_vm_address_t copy = 0;
-            vm_prot_t cur, max;
-            // Copy-on-write: nothing is duplicated until one side writes.
-            if (mach_vm_remap(mach_task_self(), &copy, e0 - s0, 0, VM_FLAGS_ANYWHERE, mach_task_self(), s0, TRUE,
-                              &cur, &max, VM_INHERIT_NONE) != KERN_SUCCESS)
-                continue;
-            if (fk->nsnaps == cap) fk->snaps = realloc(fk->snaps, (cap *= 2) * sizeof *fk->snaps);
-            fk->snaps[fk->nsnaps++] = (snapshot){s0, e0 - s0, copy, info.protection};
-            if (getenv("AM_DEBUG")) fprintf(stderr, "snap %#llx-%#llx prot %d -> copy %#llx\n", (unsigned long long)s0,
-                                            (unsigned long long)e0, info.protection, (unsigned long long)copy);
-        }
-    }
-    pthread_mutex_unlock(&p->vm_lock);
+// The parent of a vfork child waits until it execs or exits; their memory is one.
+static void vfork_done(am_proc *p) {
+    am_thread *w = p->vfork_parent;
+    if (!w) return;
+    p->vfork_parent = NULL;
+    __atomic_store_n(&w->vfork_wait, 0, __ATOMIC_SEQ_CST);
+    am_futex_wake(&w->vfork_wait, 1);
 }
 
-static void restore_memory(am_fork *fk) {
-    for (int i = 0; i < fk->nsnaps; i++) {
-        snapshot *s = &fk->snaps[i];
-        mach_vm_address_t to = s->addr;
-        vm_prot_t cur, max;
-        mach_vm_remap(mach_task_self(), &to, s->size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(),
-                      s->copy, FALSE, &cur, &max, VM_INHERIT_DEFAULT);
-        mach_vm_protect(mach_task_self(), s->addr, s->size, FALSE, s->prot);
-        mach_vm_deallocate(mach_task_self(), s->copy, s->size);
-    }
-    free(fk->snaps);
-}
-
-// Unmaps [start, end) for a fork child, except what belongs to the parent: those pages must
-// stay where they are until the parent gets them back, or a new mapping could take their place.
-void am_fork_munmap(uint64_t start, uint64_t end) {
-    am_proc *parent = am_self->fork->parent->proc;
-    pthread_mutex_lock(&parent->vm_lock);
-    uint64_t cur = start;
-    for (int j = 0; j < parent->nvma && cur < end; j++) {
-        am_vma *v = &parent->vmas[j];
-        if (v->end <= cur || v->start >= end) continue;
-        if (v->start > cur) munmap((void *)cur, v->start - cur);
-        cur = v->end;
-    }
-    if (cur < end) munmap((void *)cur, end - cur);
-    pthread_mutex_unlock(&parent->vm_lock);
-}
-
-// Ranges in the child's list that the parent does not own: the child's own allocations.
-static void release_child_ranges(am_vma *old, int nold) {
-    for (int i = 0; i < nold; i++) am_fork_munmap(old[i].start, old[i].end);
-    free(old);
-}
-
-// The fork child is done with its parent's memory (it exec'd or exited): give it back and
-// resume the parent. Runs on the host stack.
-static void fork_return(void *arg) {
-    am_thread *child = arg;
-    am_fork *fk = child->fork;
-    am_proc *cp = child->proc;
-    am_thread *parent = fk->parent;
-    if (fk->old) release_child_ranges(fk->old, fk->nold);
-    restore_memory(fk);
-    // Only now may the child's new program run: until the restore is done its mappings could be
-    // given addresses the restore is about to write.
-    if (fk->exec_thread && am_thread_start(fk->exec_thread, &fk->exec_ctx, 0))
-        fprintf(stderr, "andromach: cannot start pid %d\n", cp->pid);
-    am_ctx c = fk->ctx;
-    c.x[0] = cp->pid;
-    if (fk->parent_tid_ptr) *(int *)fk->parent_tid_ptr = cp->pid;
-    am_self = parent;
-    am_thread_tsd_init(fk->tp);
-    free(fk);
-    child->fork = NULL;
-    am_resume(&c);
-}
-
-static long sys_fork(am_ctx *c, uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid, int from_trap) {
+static long sys_fork(am_ctx *c, uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid) {
     am_thread *pt = am_self;
     am_proc *pp = pt->proc;
     am_proc *cp = am_proc_new(pp);
     am_thread *ct = am_thread_new(cp, cp->pid);  // the main thread's tid is the pid
     ct->sigmask = pt->sigmask;
-    ct->host = pthread_self();
     memcpy(ct->altstack, pt->altstack, sizeof ct->altstack);
-    am_fork *fk = calloc(1, sizeof *fk);
-    fk->parent = pt;
-    fk->ctx = *c;
+    bool shared = flags & LINUX_CLONE_VM;
+    if (shared) cp->vfork_shared = true;
+    else am_mg_fork(pp, cp);  // the child's pages: the parent's, as they are now
+    if (flags & LINUX_CLONE_PARENT_SETTID) *(int *)ptid = cp->pid;
+    if (flags & LINUX_CLONE_CHILD_SETTID) ct->start_settid = ctid;
+    if (flags & LINUX_CLONE_CHILD_CLEARTID) ct->clear_child_tid = ctid;
+    am_ctx child = *c;
+    child.x[0] = 0;
+    if (newsp) child.sp = newsp;
     uint64_t *tsd;
     __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tsd));
-    fk->tp = tsd[AM_TSD_GUEST_TP];
-    if (flags & LINUX_CLONE_PARENT_SETTID) fk->parent_tid_ptr = ptid;
-    if (!(flags & LINUX_CLONE_VM)) snapshot_memory(pp, fk);
-    ct->fork = fk;
-    // The child's writes land in what is now its memory.
-    if (flags & LINUX_CLONE_CHILD_SETTID) *(int *)ctid = cp->pid;
-    if (flags & LINUX_CLONE_CHILD_CLEARTID) ct->clear_child_tid = ctid;
-    am_self = ct;
-    am_thread_tsd_init(fk->tp);  // the child's host stack from here on
-    if (newsp) {
-        c->sp = newsp;
-        c->x[0] = 0;
-        if (!from_trap) am_resume(c);
+    if (shared && (flags & LINUX_CLONE_VFORK)) {
+        pt->vfork_wait = 1;
+        cp->vfork_parent = pt;
     }
-    return 0;
+    if (am_thread_start(ct, &child, tsd[AM_TSD_GUEST_TP])) return AM_ERR(LINUX_EAGAIN);
+    if (cp->vfork_parent) {
+        am_block_begin();
+        while (__atomic_load_n(&pt->vfork_wait, __ATOMIC_SEQ_CST))
+            am_futex_wait_interruptible(&pt->vfork_wait, 1);
+        am_block_end();
+    }
+    return cp->pid;
 }
 
 // ---- exec --------------------------------------------------------------------------------
@@ -315,7 +217,7 @@ static long sys_execve(const char *gpath, char *const *gargv, char *const *genvp
     }
 
     // Other threads go away first, as Linux kills them at exec.
-    if (!t->fork) {
+    {
         pthread_mutex_lock(&p->lock);
         for (am_thread *o = p->threads; o; o = o->next)
             if (o != t) { o->killed = true; pthread_kill(o->host, SIGUSR2); }
@@ -351,20 +253,15 @@ static long sys_execve(const char *gpath, char *const *gargv, char *const *genvp
     t->altstack[1] = 2;
     t->clear_child_tid = 0;
 
-    if (t->fork) {
-        // The new program gets its own host thread; this one goes back to the parent.
-        am_thread *nt = am_thread_new(p, p->pid);
-        nt->sigmask = t->sigmask;
-        nt->altstack[1] = 2;
-        pthread_mutex_lock(&p->lock);
-        for (am_thread **pp = &p->threads; *pp; pp = &(*pp)->next)
-            if (*pp == t) { *pp = t->next; p->nthreads--; break; }
-        pthread_mutex_unlock(&p->lock);
-        t->fork->old = old;
-        t->fork->nold = nold;
-        t->fork->exec_thread = nt;
-        t->fork->exec_ctx = nc;
-        am_run_on_host_stack(fork_return, t);
+    if (p->mg || p->vfork_shared) {
+        // The old memory is not ours alone: a group's ranges stay for the others, a vfork
+        // parent keeps all of it. Only our own allocations go.
+        if (p->mg) am_mg_leave(p, old, nold);
+        free(old);
+        old = NULL;
+        nold = 0;
+        p->vfork_shared = false;
+        vfork_done(p);
     }
     exec_tail_arg *a = malloc(sizeof *a);
     a->old = old;
@@ -415,22 +312,22 @@ void am_proc_exit(int status) {
         if (o != t) { o->killed = true; if (o->host) pthread_kill(o->host, SIGUSR2); }
     pthread_mutex_unlock(&p->lock);
     close_all_fds(p, false);
-    if (t->clear_child_tid && !t->fork) {
+    if (t->clear_child_tid) {
         __atomic_store_n((uint32_t *)t->clear_child_tid, 0, __ATOMIC_SEQ_CST);
         am_futex_wake((uint32_t *)t->clear_child_tid, 1);
     }
-    if (t->fork) {
-        // A fork child that never exec'd: its memory was the parent's.
+    if (p->mg || p->vfork_shared) {
+        // As at exec: release only what is ours alone.
         pthread_mutex_lock(&p->vm_lock);
-        t->fork->old = p->vmas;
-        t->fork->nold = p->nvma;
+        am_vma *old = p->vmas;
+        int nold = p->nvma;
         p->vmas = NULL;
         p->nvma = p->vma_cap = 0;
         pthread_mutex_unlock(&p->vm_lock);
-        p->nthreads = 0;
-        p->threads = NULL;
-        become_zombie(p, status);
-        am_run_on_host_stack(fork_return, t);
+        if (p->mg) am_mg_leave(p, old, nold);
+        free(old);
+        p->vfork_shared = false;
+        vfork_done(p);
     }
     exit_arg *a = malloc(sizeof *a);
     a->p = p;
@@ -449,7 +346,16 @@ static bool wait_match(am_proc *self, am_proc *c, int idtype, int id) {
 }
 
 // Waits for a child to end. Returns the reaped child (still allocated) or NULL with *err set.
+static am_proc *wait_child_locked(int idtype, int id, int options, long *err);
+
 static am_proc *wait_child(int idtype, int id, int options, long *err) {
+    if (!(options & 1)) am_block_begin();  // writes no guest memory while it waits
+    am_proc *r = wait_child_locked(idtype, id, options, err);
+    if (!(options & 1)) am_block_end();
+    return r;
+}
+
+static am_proc *wait_child_locked(int idtype, int id, int options, long *err) {
     am_proc *self = am_self->proc;
     pthread_mutex_lock(&ptab_lock);
     for (;;) {
@@ -488,11 +394,11 @@ long sys_proc(am_ctx *c, long nr, bool *handled, int from_trap) {
     switch (nr) {
     case LINUX_SYS_clone:
         if (A(0) & LINUX_CLONE_THREAD) break;
-        return sys_fork(c, A(0), A(1), A(2), A(4), from_trap);
+        return sys_fork(c, A(0), A(1), A(2), A(4));
     case LINUX_SYS_clone3: {
         struct { uint64_t flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls; } *a = (void *)A(0);
         if (a->flags & LINUX_CLONE_THREAD) break;
-        return sys_fork(c, a->flags, a->stack ? a->stack + a->stack_size : 0, a->parent_tid, a->child_tid, from_trap);
+        return sys_fork(c, a->flags, a->stack ? a->stack + a->stack_size : 0, a->parent_tid, a->child_tid);
     }
     case LINUX_SYS_execve: return sys_execve((const char *)A(0), (char *const *)A(1), (char *const *)A(2));
     case 281: /* execveat */ {

@@ -53,7 +53,9 @@ static void clear_ready(int rd) { char b[16]; (void)recv(rd, b, sizeof b, MSG_DO
 // Blocks until the host fd is readable (the object may still be taken by another reader).
 static void wait_readable(int fd) {
     struct pollfd p = {fd, POLLIN, 0};
+    am_block_begin();
     while (poll(&p, 1, -1) < 0 && errno == EINTR) {}
+    am_block_end();
 }
 
 static long install(am_file *f, int lflags) {
@@ -581,7 +583,9 @@ static long do_epoll_wait(int epfd, struct linux_epoll_event *out, int max, int6
             ts = (struct timespec){left / 1000000000, left % 1000000000};
             tp = &ts;
         }
+        if (!tp || tp->tv_sec || tp->tv_nsec) am_block_begin();
         int n = kevent(ep->kq, NULL, 0, kev, cap, tp);
+        if (!tp || tp->tv_sec || tp->tv_nsec) am_block_end();
         if (n < 0) {
             if (errno == EINTR) continue;
             return am_errno(errno);
@@ -635,7 +639,9 @@ static long do_pselect(int n, uint64_t *rd, uint64_t *wr, uint64_t *ex, struct l
     }
     int64_t t0 = now_ns(CLOCK_UPTIME_RAW);
     int ms = tmo ? (int)((ts_ns(tmo) + 999999) / 1000000) : -1;
+    if (ms) am_block_begin();
     int r = poll(p, np, ms);
+    if (ms) am_block_end();
     if (r < 0) return am_errno(errno);
     int words = (n + 63) / 64;
     if (rd) memset(rd, 0, words * 8);

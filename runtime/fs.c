@@ -542,6 +542,19 @@ static long do_ioctl(am_file *f, unsigned long req, uint64_t arg) {
 #define A(i) (c->x[i])
 #define STR(i) ((const char *)c->x[i])
 
+// Before a read or write that may block (pipes, sockets, terminals): wait for the host fd
+// with residency let go, so other members of a memory group can run meanwhile.
+static void wait_ready(am_file *f, short ev) {
+    if (!am_self->proc->mg || f->hostfd < 0 || f->image) return;
+    struct stat st;
+    if (fstat(f->hostfd, &st) || S_ISREG(st.st_mode) || S_ISDIR(st.st_mode)) return;
+    if (fcntl(f->hostfd, F_GETFL) & O_NONBLOCK) return;
+    struct pollfd p = {f->hostfd, ev, 0};
+    am_block_begin();
+    poll(&p, 1, -1);  // a kick cuts it short; the read or write then does the waiting
+    am_block_end();
+}
+
 static long close_fd(int fd) {
     am_proc *p = am_self->proc;
     pthread_mutex_lock(&p->lock);
@@ -627,7 +640,9 @@ static long sys_ppoll(struct pollfd *g, unsigned n, const struct linux_timespec 
     int bad = 0;
     for (unsigned i = 0; i < n; i++) if (h[i].fd == -2) { h[i].fd = -1; bad = 1; }
     int ms = ts ? (int)(ts->tv_sec * 1000 + (ts->tv_nsec + 999999) / 1000000) : -1;
+    if (!bad && ms) am_block_begin();
     int r = poll(h, n, bad ? 0 : ms);
+    if (!bad && ms) am_block_end();
     if (r < 0) return am_errno(errno);
     r = 0;
     for (unsigned i = 0; i < n; i++) {
@@ -660,11 +675,13 @@ long sys_fs(am_ctx *c, long nr, bool *handled) {
         if (!(f = am_fd_get((int)A(0)))) return AM_ERR(LINUX_EBADF);
         if (f->ops && f->ops->read) return f->ops->read(f, (void *)A(1), A(2));
         if (f->image) { r = am_pread(f, (void *)A(1), A(2), f->pos); if (r > 0) f->pos += r; return r; }
+        wait_ready(f, POLLIN);
         r = read(f->hostfd, (void *)A(1), A(2));
         return r < 0 ? am_errno(errno) : r;
     case LINUX_SYS_write:
         if (!(f = am_fd_get((int)A(0)))) return AM_ERR(LINUX_EBADF);
         if (f->ops && f->ops->write) return f->ops->write(f, (void *)A(1), A(2));
+        wait_ready(f, POLLOUT);
         r = write(f->hostfd, (void *)A(1), A(2));
         return r < 0 ? am_errno(errno) : r;
     case LINUX_SYS_readv: case LINUX_SYS_writev:

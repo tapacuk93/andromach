@@ -77,7 +77,8 @@ typedef struct am_sigaction { uint64_t handler, flags, restorer, mask; } am_siga
 typedef struct am_vma { uint64_t start, end; bool shared; } am_vma;
 
 typedef struct am_thread am_thread;
-typedef struct am_fork am_fork;
+typedef struct am_mgroup am_mgroup;
+struct am_mg_copy;
 
 typedef struct am_proc {
     int pid, ppid, pgid, sid;
@@ -100,6 +101,13 @@ typedef struct am_proc {
     int state;                     // AM_PROC_*
     int exit_status;               // wait status: exit code << 8, or the signal
     bool exiting;
+    // fork without exec (mgroup.c)
+    am_mgroup *mg;
+    struct am_mg_copy *mg_saved;   // this member's pages while another member is resident
+    int mg_nsaved;
+    // vfork / CLONE_VM | CLONE_VFORK: the memory is the parent's, which waits
+    bool vfork_shared;
+    am_thread *vfork_parent;
 } am_proc;
 
 enum { AM_PROC_RUNNING, AM_PROC_ZOMBIE, AM_PROC_REAPED };
@@ -117,8 +125,11 @@ struct am_thread {
     void *host_stack_top;
     volatile int in_runtime;       // inside a system call: asynchronous signals wait for its end
     volatile bool killed;          // asked to exit (exit_group, exec, fatal signal)
-    am_fork *fork;                 // set while this thread is a fork child running in its parent's memory
     uint32_t wake;                 // futex word: bumped when a signal is queued
+    bool mg_holds;                 // holds its memory group's residency (mgroup.c)
+    volatile bool in_block;        // waiting, residency let go
+    uint32_t vfork_wait;           // futex word: a vfork child of ours has not exec'd or exited yet
+    uint64_t start_settid;         // CLONE_CHILD_SETTID, written once the child runs in its own memory
 };
 
 extern __thread am_thread *am_self;
@@ -178,7 +189,17 @@ void am_thread_exit_tail(void *thread);
 // proc.c
 am_proc *am_proc_new(am_proc *parent);
 am_proc *am_proc_get(int pid);
-void am_fork_munmap(uint64_t start, uint64_t end);                 // NULL if no such live process
+
+// mgroup.c
+void am_mg_fork(am_proc *parent, am_proc *child);
+void am_mg_leave(am_proc *p, am_vma *old, int nold);
+void am_mg_munmap(uint64_t start, uint64_t end);
+void am_mg_acquire(void);
+void am_mg_release(void);
+void am_mg_yield(void);
+bool am_mg_wanted(void);
+void am_block_begin(void);   // around waits that touch no guest memory
+void am_block_end(void);                 // NULL if no such live process
 void am_proc_for_each(void (*fn)(am_proc *, void *), void *arg);
 long sys_proc(am_ctx *c, long nr, bool *handled, int from_trap);
 __attribute__((noreturn)) void am_proc_exit(int status);   // the calling thread's process

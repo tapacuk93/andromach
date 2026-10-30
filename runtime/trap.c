@@ -133,6 +133,10 @@ static void on_trap(int sig, siginfo_t *si, void *uv) {
         m->__ss.__pc += 4;
     } else if (imm == AM_TRAP_RESUME) {
         am_ctx_to_mc(m, (const am_ctx *)m->__ss.__x[0]);
+    } else if (dladdr((void *)m->__ss.__pc, &(Dl_info){0})) {
+        // A trap in host code (a libsystem assertion): the runtime's bug, not the guest's.
+        dump("host trap", m, m->__ss.__pc);
+        _exit(134);
     } else {
         // The guest's own breakpoint (__builtin_trap, abort's last resort): SIGTRAP to it.
         guest_fault(m, 5, 1 /* TRAP_BRKPT */, m->__ss.__pc, "guest brk");

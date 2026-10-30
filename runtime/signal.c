@@ -7,6 +7,7 @@
 // kick.
 #include "am.h"
 #include "linux.h"
+#include <dlfcn.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -239,11 +240,18 @@ static long sigreturn(am_ctx *c) {
 }
 
 // ---- host side ---------------------------------------------------------------------------
+static void park(void *unused) { am_mg_yield(); }
+
 static void on_kick(int sig, siginfo_t *si, void *uv) {
     (void)sig; (void)si;
     am_thread *t = am_self;
     if (!t || t->in_runtime) return;  // the system call in progress sees it on its way out
     struct __darwin_mcontext64 *m = ((ucontext_t *)uv)->uc_mcontext;
+    // in_runtime is set a few instructions into a system call and cleared a few before its end;
+    // around those, the thread is in host code or on its host stack, which counts as inside too.
+    uint64_t sp = m->__ss.__sp;
+    if (sp > (uint64_t)t->host_stack && sp <= (uint64_t)t->host_stack_top) return;
+    if (dladdr((void *)m->__ss.__pc, &(Dl_info){0})) return;
     am_ctx c;
     am_ctx_from_mc(&c, m);
     if (t->killed) {
@@ -257,6 +265,10 @@ static void on_kick(int sig, siginfo_t *si, void *uv) {
     }
     t->in_runtime = 1;
     if (am_signal_deliver(&c)) am_ctx_to_mc(m, &c);
+    // Another member of our memory group wants to run: park until it is our turn again. On
+    // the host stack: this handler's frames are on the guest stack, whose pages the switch
+    // swaps out.
+    if (am_mg_wanted()) am_call_on_host_stack(park, NULL);
     t->in_runtime = 0;
 }
 
@@ -369,7 +381,9 @@ long sys_signal(am_ctx *c, long nr, bool *handled, int from_trap) {
         for (;;) {
             uint32_t w = __atomic_load_n(&t->wake, __ATOMIC_SEQ_CST);
             if (deliverable(t) || t->killed) break;
+            am_block_begin();
             am_futex_wait_interruptible(&t->wake, w);
+            am_block_end();
         }
         suspend_active = true;  // the handler's frame records the old mask, restored on return
         return AM_ERR(LINUX_EINTR);
@@ -403,9 +417,13 @@ long sys_signal(am_ctx *c, long nr, bool *handled, int from_trap) {
                 clock_gettime(CLOCK_MONOTONIC, &now);
                 uint64_t n = now.tv_sec * 1000000000ull + now.tv_nsec;
                 if (n >= deadline) return AM_ERR(LINUX_EAGAIN);
+                am_block_begin();
                 usleep((deadline - n) / 1000 < 10000 ? (deadline - n) / 1000 : 10000);
+                am_block_end();
             } else {
+                am_block_begin();
                 am_futex_wait_interruptible(&t->wake, w);
+                am_block_end();
             }
         }
     }
