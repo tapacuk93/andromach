@@ -13,6 +13,8 @@
 #define LINUX_SYS_dup3 24
 #define LINUX_SYS_fcntl 25
 #define LINUX_SYS_inotify_init1 26
+#define LINUX_SYS_inotify_add_watch 27
+#define LINUX_SYS_inotify_rm_watch 28
 #define LINUX_SYS_ioctl 29
 #define LINUX_SYS_flock 32
 #define LINUX_SYS_mknodat 33
@@ -46,6 +48,7 @@
 #define LINUX_SYS_sendfile 71
 #define LINUX_SYS_pselect6 72
 #define LINUX_SYS_ppoll 73
+#define LINUX_SYS_signalfd4 74
 #define LINUX_SYS_readlinkat 78
 #define LINUX_SYS_newfstatat 79
 #define LINUX_SYS_fstat 80
@@ -53,6 +56,8 @@
 #define LINUX_SYS_fsync 82
 #define LINUX_SYS_fdatasync 83
 #define LINUX_SYS_timerfd_create 85
+#define LINUX_SYS_timerfd_settime 86
+#define LINUX_SYS_timerfd_gettime 87
 #define LINUX_SYS_utimensat 88
 #define LINUX_SYS_capget 90
 #define LINUX_SYS_capset 91
@@ -149,8 +154,10 @@
 #define LINUX_SYS_mincore 232
 #define LINUX_SYS_madvise 233
 #define LINUX_SYS_accept4 242
+#define LINUX_SYS_recvmmsg 243
 #define LINUX_SYS_wait4 260
 #define LINUX_SYS_prlimit64 261
+#define LINUX_SYS_sendmmsg 269
 #define LINUX_SYS_renameat2 276
 #define LINUX_SYS_syncfs 267
 #define LINUX_SYS_getrandom 278
@@ -163,6 +170,7 @@
 #define LINUX_SYS_clone3 435
 #define LINUX_SYS_close_range 436
 #define LINUX_SYS_faccessat2 439
+#define LINUX_SYS_epoll_pwait2 441
 
 // ---- errno -------------------------------------------------------------------------------
 #define LINUX_EPERM 1

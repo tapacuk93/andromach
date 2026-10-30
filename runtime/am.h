@@ -37,6 +37,7 @@ _Static_assert(sizeof(am_ctx) == 800, "entry.S frame");
 // fd. Files the runtime implements itself (sockets, eventfd, binder, ...) add ops; any op left
 // NULL falls back to the host fd.
 typedef struct am_file am_file;
+struct iovec;
 typedef struct am_file_ops {
     const char *name;
     long (*read)(am_file *f, void *buf, size_t n);
@@ -44,6 +45,9 @@ typedef struct am_file_ops {
     long (*ioctl)(am_file *f, unsigned long req, uint64_t arg);
     long (*mmap)(am_file *f, uint64_t addr, uint64_t len, int prot, int flags, uint64_t off);
     void (*release)(am_file *f);   // last reference gone; the host fd is closed after it
+    // Whole-vector I/O, for files where one readv/writev is one message (datagram sockets).
+    long (*readv)(am_file *f, const struct iovec *iov, int n);
+    long (*writev)(am_file *f, const struct iovec *iov, int n);
 } am_file_ops;
 
 // A device under /dev the runtime implements: open returns 0 and fills *out, or -errno.
@@ -192,6 +196,9 @@ void am_ctx_to_mc(void *mcontext, const am_ctx *c);
 // net.c, event.c, binder.c
 long sys_net(am_ctx *c, long nr, bool *handled);
 long sys_event(am_ctx *c, long nr, bool *handled);
+void am_event_file_gone(am_file *f);      // drops f from every epoll set; called before release
+void am_event_hostfd_changed(am_file *f); // f->hostfd now names another host object
+bool am_sock_peer_gone(am_file *f);       // for EPOLLHUP: the other end is closed
 void am_binder_init(void);
 
 // loader.c

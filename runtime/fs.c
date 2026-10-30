@@ -206,6 +206,7 @@ int am_fd_install(am_proc *p, am_file *f, int min, bool cloexec) {
 
 void am_file_put(am_file *f) {
     if (__atomic_sub_fetch(&f->refs, 1, __ATOMIC_ACQ_REL)) return;
+    am_event_file_gone(f);
     if (f->ops && f->ops->release) f->ops->release(f);
     if (f->hostfd > 2) close(f->hostfd);
     free(f->gpath);
@@ -629,6 +630,8 @@ long sys_fs(am_ctx *c, long nr, bool *handled) {
         return r < 0 ? am_errno(errno) : r;
     case LINUX_SYS_readv: case LINUX_SYS_writev:
         if (!(f = am_fd_get((int)A(0)))) return AM_ERR(LINUX_EBADF);
+        if (f->ops && nr == LINUX_SYS_readv && f->ops->readv) return f->ops->readv(f, (void *)A(1), (int)A(2));
+        if (f->ops && nr == LINUX_SYS_writev && f->ops->writev) return f->ops->writev(f, (void *)A(1), (int)A(2));
         if (f->ops && (nr == LINUX_SYS_readv ? (void *)f->ops->read : (void *)f->ops->write)) {
             const struct iovec *iov = (void *)A(1);
             long total = 0;
