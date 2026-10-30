@@ -128,7 +128,18 @@ long am_exec(am_ctx *c, const char *gpath, char *const argv[], char *const envp[
         entry = interp.entry;
         interp_base = interp.base;
     }
-    snprintf(am_self->proc->exe, sizeof am_self->proc->exe, "%s", canon);
+    am_proc *p = am_self->proc;
+    snprintf(p->exe, sizeof p->exe, "%s", canon);
+    size_t cl = 0;
+    for (int i = 0; argv[i]; i++) cl += strlen(argv[i]) + 1;
+    free(p->cmdline);
+    p->cmdline = malloc(cl ? cl : 1);
+    p->cmdline_len = 0;
+    for (int i = 0; argv[i]; i++) {
+        size_t n = strlen(argv[i]) + 1;
+        memcpy(p->cmdline + p->cmdline_len, argv[i], n);
+        p->cmdline_len += n;
+    }
 
     size_t stack_size = 8 << 20;
     long stack_r = am_mmap(0, stack_size, LINUX_PROT_READ | LINUX_PROT_WRITE, LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS, -1, 0);

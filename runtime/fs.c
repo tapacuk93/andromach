@@ -277,7 +277,10 @@ static void detect_image(am_file *f) {
 
 long am_open(const char *gpath, int dirfd, int lflags, int mode, am_file **out) {
     char host[4096], canon[4096];
+    canon[0] = 0;
     int r = am_resolve(dirfd, gpath, !(lflags & LINUX_O_NOFOLLOW), host, sizeof host, canon, sizeof canon);
+    if ((r == 0 || r == AM_ERR(LINUX_ENOENT)) && (under(canon, "/proc") || under(canon, "/sys")))
+        return am_procfs_open(canon, lflags, out);
     if (r < 0) return r;
     am_dev_open_fn dev = dev_lookup(canon);
     if (dev) {
@@ -340,6 +343,26 @@ static long stat_path(const char *host, bool follow, struct linux_stat *out) {
     return 0;
 }
 
+static long do_fstat(am_file *f, struct linux_stat *out);
+
+// /proc and /sys entries exist when they can be opened.
+static long virtual_stat(const char *canon, struct linux_stat *out) {
+    char target[4096];
+    if (magic_link(canon, target, sizeof target)) {
+        memset(out, 0, sizeof *out);
+        out->st_mode = 0120777;  // S_IFLNK
+        out->st_nlink = 1;
+        out->st_size = strlen(target);
+        return 0;
+    }
+    am_file *f;
+    long r = am_procfs_open(canon, LINUX_O_RDONLY, &f);
+    if (r < 0) return r;
+    r = do_fstat(f, out);
+    am_file_put(f);
+    return r;
+}
+
 static long do_fstat(am_file *f, struct linux_stat *out) {
     struct stat st;
     if (fstat(f->hostfd, &st)) return am_errno(errno);
@@ -355,9 +378,11 @@ static long do_statx(int dirfd, const char *path, int flags, struct linux_statx 
         if (!f) return AM_ERR(LINUX_EBADF);
         r = do_fstat(f, &st);
     } else {
-        char host[4096];
-        r = am_resolve(dirfd, path, !(flags & LINUX_AT_SYMLINK_NOFOLLOW), host, sizeof host, NULL, 0);
-        if (r == 0) r = stat_path(host, !(flags & LINUX_AT_SYMLINK_NOFOLLOW), &st);
+        char host[4096], canon[4096];
+        r = am_resolve(dirfd, path, !(flags & LINUX_AT_SYMLINK_NOFOLLOW), host, sizeof host, canon, sizeof canon);
+        if (r < 0 && r != AM_ERR(LINUX_ENOENT)) return r;
+        if (under(canon, "/proc") || under(canon, "/sys")) r = virtual_stat(canon, &st);
+        else if (r == 0) r = stat_path(host, !(flags & LINUX_AT_SYMLINK_NOFOLLOW), &st);
     }
     if (r) return r;
     memset(sx, 0, sizeof *sx);
@@ -652,8 +677,12 @@ long sys_fs(am_ctx *c, long nr, bool *handled) {
             if (!(f = am_fd_get((int)A(0)))) return AM_ERR(LINUX_EBADF);
             return do_fstat(f, (void *)A(2));
         }
-        r = am_resolve((int)A(0), STR(1), !(A(3) & LINUX_AT_SYMLINK_NOFOLLOW), host, sizeof host, NULL, 0);
-        return r < 0 ? r : stat_path(host, !(A(3) & LINUX_AT_SYMLINK_NOFOLLOW), (void *)A(2));
+        {
+            char canon[4096];
+            r = am_resolve((int)A(0), STR(1), !(A(3) & LINUX_AT_SYMLINK_NOFOLLOW), host, sizeof host, canon, sizeof canon);
+            if (under(canon, "/proc") || under(canon, "/sys")) return virtual_stat(canon, (void *)A(2));
+            return r < 0 ? r : stat_path(host, !(A(3) & LINUX_AT_SYMLINK_NOFOLLOW), (void *)A(2));
+        }
     case LINUX_SYS_fstat:
         if (!(f = am_fd_get((int)A(0)))) return AM_ERR(LINUX_EBADF);
         return do_fstat(f, (void *)A(1));
@@ -670,8 +699,15 @@ long sys_fs(am_ctx *c, long nr, bool *handled) {
         return n;
     }
     case LINUX_SYS_faccessat: case LINUX_SYS_faccessat2:
-        r = am_resolve((int)A(0), STR(1), !(nr == LINUX_SYS_faccessat2 && (A(3) & LINUX_AT_SYMLINK_NOFOLLOW)),
-                       host, sizeof host, NULL, 0);
+        {
+            char canon[4096];
+            r = am_resolve((int)A(0), STR(1), !(nr == LINUX_SYS_faccessat2 && (A(3) & LINUX_AT_SYMLINK_NOFOLLOW)),
+                           host, sizeof host, canon, sizeof canon);
+            if (under(canon, "/proc") || under(canon, "/sys")) {
+                struct linux_stat st;
+                return virtual_stat(canon, &st);
+            }
+        }
         if (r < 0) return r;
         return access(host, (int)A(2) & 7) ? am_errno(errno) : 0;
     case LINUX_SYS_getdents64:
@@ -752,7 +788,9 @@ long sys_fs(am_ctx *c, long nr, bool *handled) {
         }
         struct linux_statfs *l = (void *)A(1);
         memset(l, 0, sizeof *l);
-        l->f_type = 0xEF53;  // ext4
+        const char *gp = nr == LINUX_SYS_statfs ? STR(0) : f->gpath ? f->gpath : "";
+        l->f_type = under(gp, "/sys/fs/selinux") ? 0xF97CFF8C : under(gp, "/proc") ? 0x9FA0
+                  : under(gp, "/sys") ? 0x62656572 : 0xEF53;  // selinuxfs, proc, sysfs, ext4
         l->f_bsize = s.f_bsize; l->f_blocks = s.f_blocks; l->f_bfree = s.f_bfree;
         l->f_bavail = s.f_bavail; l->f_files = s.f_files; l->f_ffree = s.f_ffree;
         l->f_namelen = 255; l->f_frsize = s.f_bsize;

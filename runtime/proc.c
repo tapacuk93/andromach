@@ -42,6 +42,11 @@ am_proc *am_proc_new(am_proc *parent) {
         p->umask = parent->umask;
         memcpy(p->cwd, parent->cwd, sizeof p->cwd);
         memcpy(p->exe, parent->exe, sizeof p->exe);
+        if (parent->cmdline) {
+            p->cmdline = malloc(parent->cmdline_len);
+            memcpy(p->cmdline, parent->cmdline, parent->cmdline_len);
+            p->cmdline_len = parent->cmdline_len;
+        }
         memcpy(p->sig, parent->sig, sizeof p->sig);
         pthread_mutex_lock(&parent->lock);
         for (int i = 0; i < AM_MAX_FDS; i++)

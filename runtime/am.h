@@ -82,6 +82,8 @@ typedef struct am_proc {
     uint8_t cloexec[AM_MAX_FDS];
     char cwd[1024];
     char exe[1024];
+    char *cmdline;                 // argv, NUL-separated, for /proc/<pid>/cmdline
+    size_t cmdline_len;
     am_sigaction sig[65];
     uint64_t sigpending;           // process-directed signals not yet taken by a thread
     uint32_t umask;
@@ -145,6 +147,9 @@ void am_file_put(am_file *f);
 long am_pread(am_file *f, void *buf, size_t n, uint64_t off);
 long sys_fs(am_ctx *c, long nr, bool *handled);
 am_file *am_file_new(int hostfd, int lflags, const char *gpath, const am_file_ops *ops, void *priv);
+
+// procfs.c
+long am_procfs_open(const char *canon, int lflags, am_file **out);
 
 // mm.c
 long am_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, uint64_t off);
