@@ -730,7 +730,28 @@ static long send_inet(am_file *f, const sendargs *a) {
     }
     struct msghdr m = {.msg_name = a->addr ? &h : NULL, .msg_namelen = hl, .msg_iov = (struct iovec *)a->iov,
                        .msg_iovlen = a->iovcnt};
+    // Linux ping sockets fill in the ICMP checksum; Darwin drops a message without one.
+    sock *s = f->priv;
+    uint8_t *pkt = NULL;
+    struct iovec pv;
+    size_t len = iov_total(a->iov, a->iovcnt);
+    if (s->family == L_AF_INET && s->type == L_SOCK_DGRAM && s->proto == IPPROTO_ICMP && len >= 8) {
+        pkt = malloc(len + 1);
+        size_t off = 0;
+        for (int i = 0; i < a->iovcnt; i++) { memcpy(pkt + off, a->iov[i].iov_base, a->iov[i].iov_len); off += a->iov[i].iov_len; }
+        pkt[len] = 0;
+        pkt[2] = pkt[3] = 0;
+        uint32_t sum = 0;
+        for (size_t i = 0; i < len; i += 2) sum += (uint32_t)pkt[i] << 8 | pkt[i + 1];
+        while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+        pkt[2] = (uint8_t)(~sum >> 8);
+        pkt[3] = (uint8_t)~sum;
+        pv = (struct iovec){pkt, len};
+        m.msg_iov = &pv;
+        m.msg_iovlen = 1;
+    }
     ssize_t r = sendmsg(f->hostfd, &m, darwin_msg_flags(a->flags));
+    free(pkt);
     return r < 0 ? am_errno(errno) : r;
 }
 
@@ -898,10 +919,32 @@ typedef struct {
 } recvargs;
 
 static long recv_inet(am_file *f, recvargs *a) {
+    sock *s = f->priv;
     struct sockaddr_storage h;
     struct msghdr m = {.msg_name = &h, .msg_namelen = sizeof h, .msg_iov = (struct iovec *)a->iov, .msg_iovlen = a->iovcnt};
+    // Darwin's ICMP datagram sockets hand over the IP header too; Linux ping sockets do not.
+    bool icmp = s->family == L_AF_INET && s->type == L_SOCK_DGRAM && s->proto == IPPROTO_ICMP;
+    size_t cap = iov_total(a->iov, a->iovcnt);
+    uint8_t *pkt = NULL;
+    struct iovec pv;
+    if (icmp) {
+        pv = (struct iovec){pkt = malloc(cap + 60), cap + 60};
+        m.msg_iov = &pv;
+        m.msg_iovlen = 1;
+    }
     ssize_t r = recvmsg(f->hostfd, &m, darwin_msg_flags(a->flags));
-    if (r < 0) return am_errno(errno);
+    if (r < 0) { free(pkt); return am_errno(errno); }
+    if (icmp) {
+        size_t ihl = r > 0 ? (size_t)(pkt[0] & 0xF) * 4 : 0;
+        r = (size_t)r > ihl ? r - (ssize_t)ihl : 0;
+        size_t off = 0;
+        for (int i = 0; i < a->iovcnt && off < (size_t)r; i++) {
+            size_t n = a->iov[i].iov_len < (size_t)r - off ? a->iov[i].iov_len : (size_t)r - off;
+            memcpy(a->iov[i].iov_base, pkt + ihl + off, n);
+            off += n;
+        }
+        free(pkt);
+    }
     a->oflags |= linux_msg_flags(m.msg_flags);
     if (a->addr && a->addrlen) {
         uint8_t out[28];
