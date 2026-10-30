@@ -163,6 +163,15 @@ static long sys_misc(am_ctx *c, long nr, bool *handled) {
     case LINUX_SYS_membarrier: return A(0) == 0 ? 0 : 0;
     case LINUX_SYS_rseq: return AM_ERR(LINUX_ENOSYS);
     case LINUX_SYS_fadvise64: return 0;
+    // Extended attributes: only SELinux labels use them, and there is no SELinux policy.
+    case 5: case 6: case 7: return 0;                       // setxattr, lsetxattr, fsetxattr
+    case 8: case 9: case 10: return AM_ERR(61);             // getxattr...: ENODATA
+    case 11: case 12: case 13: return 0;                    // listxattr...: none
+    case 14: case 15: case 16: return AM_ERR(61);           // removexattr...
+    // mount, umount2, pivot_root, swapon: the guest's file system layout is fixed at build time.
+    case 40: case 39: case 41: case 224: case 225: return 0;
+    case 219: /* keyctl */ return AM_ERR(LINUX_ENOSYS);
+    case 142: /* reboot */ fprintf(stderr, "andromach: guest asked to reboot/power off\n"); fflush(NULL); _exit(0);
 
     }
     *handled = false;

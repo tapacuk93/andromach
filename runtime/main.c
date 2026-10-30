@@ -44,6 +44,7 @@ int main(int argc, char **argv) {
     am_trap_init();
     am_signal_init();
     am_binder_init();
+    am_fs_register_devices();
     am_thread_tsd_init(0);
 
     char *envp[] = {

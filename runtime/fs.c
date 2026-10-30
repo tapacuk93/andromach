@@ -20,9 +20,29 @@
 // ---- mounts ------------------------------------------------------------------------------
 // Guest directories backed by the writable data directory rather than the read-only root.
 static const char *writable[] = {"/data", "/tmp", "/cache", "/mnt", "/storage", "/data_mirror",
-                                 "/metadata", "/dev/socket", "/dev/__properties__", "/linkerconfig", NULL};
+                                 "/metadata", "/linkerconfig", "/debug_ramdisk", NULL};
 // Host device nodes the guest may open.
 static const char *devices[] = {"null", "zero", "random", "urandom", "tty", "ptmx", NULL};
+
+// /dev/kmsg: the kernel log, where init writes before logd exists. It goes to the host's stderr.
+static long kmsg_write(am_file *f, const void *b, size_t n) {
+    const char *s = b;
+    size_t skip = 0;
+    if (n > 3 && s[0] == '<' && s[2] == '>') skip = 3;  // the "<6>" priority prefix
+    if (write(2, s + skip, n - skip) < 0) return am_errno(errno);
+    return n;
+}
+static long kmsg_read(am_file *f, void *b, size_t n) { return AM_ERR(LINUX_EAGAIN); }
+static const am_file_ops kmsg_ops = {.name = "kmsg", .read = kmsg_read, .write = kmsg_write};
+static long kmsg_open(const char *name, int lflags, am_file **out) {
+    *out = am_file_new(dup(2), lflags, "/dev/kmsg", &kmsg_ops, NULL);
+    return 0;
+}
+
+void am_fs_register_devices(void) {
+    am_dev_register("kmsg", kmsg_open);
+    am_dev_register("kmsg_debug", kmsg_open);
+}
 
 static struct { const char *name; am_dev_open_fn open; } devs[32];
 static int ndevs;
@@ -53,11 +73,12 @@ static int host_path(const char *canon, char *out, size_t n) {
             return 0;
         }
     if (under(canon, "/dev")) {
-        if (!strcmp(canon, "/dev")) { snprintf(out, n, "%s/dev", am_datadir); return 0; }
         for (const char **d = devices; *d; d++)
             if (!strcmp(canon + 5, *d)) { snprintf(out, n, "/dev/%s", *d); return 0; }
         if (dev_lookup(canon)) { snprintf(out, n, "/dev/null"); return 0; }  // stat-able stand-in
-        return AM_ERR(LINUX_ENOENT);
+        // The rest of /dev is a tmpfs: writable, and emptied at every start.
+        snprintf(out, n, "%s%s", am_datadir, canon);
+        return 0;
     }
     if (under(canon, "/proc") || under(canon, "/sys")) {
         // Not modelled yet beyond the magic links resolved in am_resolve.
@@ -174,10 +195,12 @@ void am_fs_init(am_proc *p) {
         f->gpath = strdup("/dev/tty");
         p->fds[i] = f;
     }
-    // Directories the writable mounts and /dev need on the host.
+    // /dev starts empty, as the tmpfs it stands for.
     char hp[4096];
+    snprintf(hp, sizeof hp, "rm -rf '%s/dev'", am_datadir);
+    if (system(hp)) {}
     const char *dirs[] = {"/data", "/data/local/tmp", "/tmp", "/cache", "/dev", "/dev/socket",
-                          "/dev/__properties__", "/proc", "/sys", "/linkerconfig", NULL};
+                          "/proc", "/sys", "/linkerconfig", "/debug_ramdisk", "/mnt", "/metadata", NULL};
     for (const char **d = dirs; *d; d++) {
         snprintf(hp, sizeof hp, "%s%s", am_datadir, *d);
         char *s = hp + strlen(am_datadir);
@@ -319,8 +342,10 @@ static void to_linux_stat(struct linux_stat *l, const struct stat *s, const am_f
     l->st_ino = s->st_ino;
     l->st_mode = s->st_mode;
     l->st_nlink = s->st_nlink;
-    l->st_uid = s->st_uid;
-    l->st_gid = s->st_gid;
+    // Everything belongs to root for now: the host's uid means nothing to the guest, and
+    // bionic refuses property files that are not root's. Per-file ownership comes later.
+    l->st_uid = 0;
+    l->st_gid = 0;
     l->st_rdev = s->st_rdev;
     l->st_size = img ? (int64_t)img->size : s->st_size;
     l->st_blksize = s->st_blksize;

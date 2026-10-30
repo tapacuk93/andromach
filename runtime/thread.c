@@ -11,7 +11,7 @@
 #include <time.h>
 #include <unistd.h>
 
-static int next_tid = 1000;  // pids and tids share one space, as on Linux
+static int next_tid = 0;  // pids and tids share one space, as on Linux; the first process is pid 1
 
 int am_new_tid(void) { return __atomic_add_fetch(&next_tid, 1, __ATOMIC_RELAXED); }
 

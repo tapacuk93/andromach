@@ -139,6 +139,7 @@ long am_errno(int darwin_errno);
 
 // fs.c
 void am_fs_init(am_proc *p);
+void am_fs_register_devices(void);
 int am_resolve(int dirfd, const char *gpath, bool follow, char *host, size_t hostsz, char *canon, size_t canonsz);
 long am_open(const char *gpath, int dirfd, int lflags, int mode, am_file **out);
 int am_fd_install(am_proc *p, am_file *f, int min, bool cloexec);
