@@ -30,6 +30,7 @@ long am_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, uint64_t 
         if ((prot & LINUX_PROT_EXEC) && am_deny_exec) return AM_ERR(LINUX_EACCES);
     } else {
         if (!(f = am_fd_get(fd))) return AM_ERR(LINUX_EBADF);
+        if (f->ops && f->ops->mmap) return f->ops->mmap(f, addr, len, prot, flags, off);
         if ((prot & LINUX_PROT_EXEC) && am_deny_exec && !f->image) return AM_ERR(LINUX_EACCES);
         hfd = f->hostfd;
         if (f->image) off += f->base;

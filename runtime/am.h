@@ -32,11 +32,28 @@ typedef struct am_ctx {
 _Static_assert(sizeof(am_ctx) == 800, "entry.S frame");
 
 // ---- open files --------------------------------------------------------------------------
-enum { AMF_HOST, AMF_DIR_LIST };
+// Every open file has a host fd when it can: poll, epoll and readiness then work on the host
+// fd. Files the runtime implements itself (sockets, eventfd, binder, ...) add ops; any op left
+// NULL falls back to the host fd.
+typedef struct am_file am_file;
+typedef struct am_file_ops {
+    const char *name;
+    long (*read)(am_file *f, void *buf, size_t n);
+    long (*write)(am_file *f, const void *buf, size_t n);
+    long (*ioctl)(am_file *f, unsigned long req, uint64_t arg);
+    long (*mmap)(am_file *f, uint64_t addr, uint64_t len, int prot, int flags, uint64_t off);
+    void (*release)(am_file *f);   // last reference gone; the host fd is closed after it
+} am_file_ops;
 
-typedef struct am_file {
+// A device under /dev the runtime implements: open returns 0 and fills *out, or -errno.
+typedef long (*am_dev_open_fn)(const char *name, int lflags, am_file **out);
+void am_dev_register(const char *name, am_dev_open_fn open);
+
+struct am_file {
     int refs;
     int hostfd;
+    const am_file_ops *ops;
+    void *priv;
     int lflags;          // Linux open flags
     bool image;          // a precompiled image: the guest sees [base, base + size)
     uint64_t base, size;
@@ -44,7 +61,7 @@ typedef struct am_file {
     char *gpath;         // guest path it was opened by (for *at() and /proc/self/fd)
     // getdents64 state
     void *dents; size_t dents_len, dents_pos;
-} am_file;
+};
 
 #define AM_MAX_FDS 1024
 
@@ -99,6 +116,7 @@ am_file *am_fd_get(int fd);
 void am_file_put(am_file *f);
 long am_pread(am_file *f, void *buf, size_t n, uint64_t off);
 long sys_fs(am_ctx *c, long nr, bool *handled);
+am_file *am_file_new(int hostfd, int lflags, const char *gpath, const am_file_ops *ops, void *priv);
 
 // mm.c
 long am_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, uint64_t off);
@@ -108,6 +126,11 @@ long sys_mm(am_ctx *c, long nr, bool *handled);
 long sys_thread(am_ctx *c, long nr, bool *handled);
 am_thread *am_thread_new(am_proc *p, int tid);
 int am_new_tid(void);
+
+// net.c, event.c, binder.c
+long sys_net(am_ctx *c, long nr, bool *handled);
+long sys_event(am_ctx *c, long nr, bool *handled);
+void am_binder_init(void);
 
 // loader.c
 long am_exec(am_ctx *c, const char *gpath, char *const argv[], char *const envp[]);

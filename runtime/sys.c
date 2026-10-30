@@ -232,6 +232,8 @@ void am_syscall(am_ctx *c) {
     if (!handled) r = sys_mm(c, nr, &handled);
     if (!handled) r = sys_thread(c, nr, &handled);
     if (!handled) r = sys_misc(c, nr, &handled);
+    if (!handled) r = sys_net(c, nr, &handled);
+    if (!handled) r = sys_event(c, nr, &handled);
     if (!handled) {
         if (am_strace || nr != LINUX_SYS_rseq) {
             const char *n = nr >= 0 && nr < (long)(sizeof names / sizeof *names) ? names[nr] : NULL;

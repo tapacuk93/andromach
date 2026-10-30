@@ -44,6 +44,7 @@ int main(int argc, char **argv) {
     am_fs_init(&proc);
     am_self = am_thread_new(&proc, proc.pid);
     am_trap_init();
+    am_binder_init();
     am_thread_tsd_init(0);
 
     char *envp[] = {

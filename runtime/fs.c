@@ -24,6 +24,22 @@ static const char *writable[] = {"/data", "/tmp", "/cache", "/mnt", "/storage", 
 // Host device nodes the guest may open.
 static const char *devices[] = {"null", "zero", "random", "urandom", "tty", "ptmx", NULL};
 
+static struct { const char *name; am_dev_open_fn open; } devs[32];
+static int ndevs;
+
+void am_dev_register(const char *name, am_dev_open_fn open) {
+    devs[ndevs].name = name;
+    devs[ndevs].open = open;
+    ndevs++;
+}
+
+static am_dev_open_fn dev_lookup(const char *canon) {
+    if (strncmp(canon, "/dev/", 5)) return NULL;
+    for (int i = 0; i < ndevs; i++)
+        if (!strcmp(canon + 5, devs[i].name)) return devs[i].open;
+    return NULL;
+}
+
 static bool under(const char *path, const char *prefix) {
     size_t n = strlen(prefix);
     return strncmp(path, prefix, n) == 0 && (path[n] == 0 || path[n] == '/');
@@ -40,6 +56,7 @@ static int host_path(const char *canon, char *out, size_t n) {
         if (!strcmp(canon, "/dev")) { snprintf(out, n, "%s/dev", am_datadir); return 0; }
         for (const char **d = devices; *d; d++)
             if (!strcmp(canon + 5, *d)) { snprintf(out, n, "/dev/%s", *d); return 0; }
+        if (dev_lookup(canon)) { snprintf(out, n, "/dev/null"); return 0; }  // stat-able stand-in
         return AM_ERR(LINUX_ENOENT);
     }
     if (under(canon, "/proc") || under(canon, "/sys")) {
@@ -188,19 +205,26 @@ int am_fd_install(am_proc *p, am_file *f, int min, bool cloexec) {
 
 void am_file_put(am_file *f) {
     if (__atomic_sub_fetch(&f->refs, 1, __ATOMIC_ACQ_REL)) return;
+    if (f->ops && f->ops->release) f->ops->release(f);
     if (f->hostfd > 2) close(f->hostfd);
     free(f->gpath);
     free(f->dents);
     free(f);
 }
 
-static am_file *file_new(int hostfd, int lflags, const char *gpath) {
+am_file *am_file_new(int hostfd, int lflags, const char *gpath, const am_file_ops *ops, void *priv) {
     am_file *f = calloc(1, sizeof *f);
     f->refs = 1;
     f->hostfd = hostfd;
     f->lflags = lflags;
     f->gpath = gpath ? strdup(gpath) : NULL;
+    f->ops = ops;
+    f->priv = priv;
     return f;
+}
+
+static am_file *file_new(int hostfd, int lflags, const char *gpath) {
+    return am_file_new(hostfd, lflags, gpath, NULL, NULL);
 }
 
 static int darwin_oflags(int l) {
@@ -254,6 +278,12 @@ long am_open(const char *gpath, int dirfd, int lflags, int mode, am_file **out) 
     char host[4096], canon[4096];
     int r = am_resolve(dirfd, gpath, !(lflags & LINUX_O_NOFOLLOW), host, sizeof host, canon, sizeof canon);
     if (r < 0) return r;
+    am_dev_open_fn dev = dev_lookup(canon);
+    if (dev) {
+        r = dev(canon + 5, lflags, out);
+        if (r == 0 && !(*out)->gpath) (*out)->gpath = strdup(canon);
+        return r;
+    }
     int fd;
     if (lflags & LINUX_O_PATH) {
         fd = open(host, O_RDONLY | O_CLOEXEC | ((lflags & LINUX_O_NOFOLLOW) ? O_SYMLINK : 0));
@@ -407,6 +437,7 @@ static const int cc_map[][2] = {  // Linux index, Darwin index
     for (size_t _i = 0; _i < sizeof tbl / sizeof *tbl; _i++) if ((src) & tbl[_i].from) _o |= tbl[_i].to; _o; })
 
 static long do_ioctl(am_file *f, unsigned long req, uint64_t arg) {
+    if (f->ops && f->ops->ioctl) return f->ops->ioctl(f, req, arg);
     int fd = f->hostfd;
     switch (req) {
     case LINUX_TCGETS: {
@@ -561,15 +592,29 @@ long sys_fs(am_ctx *c, long nr, bool *handled) {
     case LINUX_SYS_close: return close_fd((int)A(0));
     case LINUX_SYS_read:
         if (!(f = am_fd_get((int)A(0)))) return AM_ERR(LINUX_EBADF);
+        if (f->ops && f->ops->read) return f->ops->read(f, (void *)A(1), A(2));
         if (f->image) { r = am_pread(f, (void *)A(1), A(2), f->pos); if (r > 0) f->pos += r; return r; }
         r = read(f->hostfd, (void *)A(1), A(2));
         return r < 0 ? am_errno(errno) : r;
     case LINUX_SYS_write:
         if (!(f = am_fd_get((int)A(0)))) return AM_ERR(LINUX_EBADF);
+        if (f->ops && f->ops->write) return f->ops->write(f, (void *)A(1), A(2));
         r = write(f->hostfd, (void *)A(1), A(2));
         return r < 0 ? am_errno(errno) : r;
     case LINUX_SYS_readv: case LINUX_SYS_writev:
         if (!(f = am_fd_get((int)A(0)))) return AM_ERR(LINUX_EBADF);
+        if (f->ops && (nr == LINUX_SYS_readv ? (void *)f->ops->read : (void *)f->ops->write)) {
+            const struct iovec *iov = (void *)A(1);
+            long total = 0;
+            for (int i = 0; i < (int)A(2); i++) {
+                r = nr == LINUX_SYS_readv ? f->ops->read(f, iov[i].iov_base, iov[i].iov_len)
+                                          : f->ops->write(f, iov[i].iov_base, iov[i].iov_len);
+                if (r < 0) return total ? total : r;
+                total += r;
+                if ((size_t)r < iov[i].iov_len) break;
+            }
+            return total;
+        }
         if (f->image && nr == LINUX_SYS_readv) {
             struct iovec *iov = (void *)A(1);
             long total = 0;
