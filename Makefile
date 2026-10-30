@@ -9,7 +9,15 @@ build/amrun: $(SRC) $(HDR)
 	$(CC) $(CFLAGS) -o $@ $(SRC)
 	codesign -s - -f $@
 
-clean:
-	rm -rf build/amrun
+# The binder driver against fake guest processes and threads, with the sanitizers on.
+build/binder_test: tests/binder_test.c runtime/binder.c runtime/fs.c $(HDR)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ tests/binder_test.c runtime/binder.c runtime/fs.c
 
-.PHONY: clean
+test-binder: build/binder_test
+	build/binder_test
+
+clean:
+	rm -rf build/amrun build/binder_test
+
+.PHONY: clean test-binder

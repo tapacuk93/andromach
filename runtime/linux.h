@@ -176,6 +176,7 @@
 #define LINUX_ENOMEM 12
 #define LINUX_EACCES 13
 #define LINUX_EFAULT 14
+#define LINUX_EBUSY 16
 #define LINUX_EEXIST 17
 #define LINUX_ENOTDIR 20
 #define LINUX_EISDIR 21
@@ -340,3 +341,136 @@ struct linux_sysinfo {
     uint32_t mem_unit;
     char _f[4];
 };
+
+// ---- binder (include/uapi/linux/android/binder.h, 64-bit protocol 8) -----------------------
+#define LINUX_IOC(dir, type, nr, size) (((uint32_t)(dir) << 30) | ((uint32_t)(size) << 16) | ((type) << 8) | (nr))
+#define LINUX_IO(t, n) LINUX_IOC(0, t, n, 0)
+#define LINUX_IOW(t, n, sz) LINUX_IOC(1, t, n, sz)
+#define LINUX_IOR(t, n, sz) LINUX_IOC(2, t, n, sz)
+#define LINUX_IOWR(t, n, sz) LINUX_IOC(3, t, n, sz)
+#define LINUX_IOC_SIZE(c) (((c) >> 16) & 0x3FFF)
+
+#define BINDER_PACK(a, b, c, d) (((uint32_t)(a) << 24) | ((uint32_t)(b) << 16) | ((uint32_t)(c) << 8) | (d))
+#define BINDER_TYPE_BINDER BINDER_PACK('s', 'b', '*', 0x85)
+#define BINDER_TYPE_WEAK_BINDER BINDER_PACK('w', 'b', '*', 0x85)
+#define BINDER_TYPE_HANDLE BINDER_PACK('s', 'h', '*', 0x85)
+#define BINDER_TYPE_WEAK_HANDLE BINDER_PACK('w', 'h', '*', 0x85)
+#define BINDER_TYPE_FD BINDER_PACK('f', 'd', '*', 0x85)
+#define BINDER_TYPE_FDA BINDER_PACK('f', 'd', 'a', 0x85)
+#define BINDER_TYPE_PTR BINDER_PACK('p', 't', '*', 0x85)
+
+#define FLAT_BINDER_FLAG_ACCEPTS_FDS 0x100
+#define FLAT_BINDER_FLAG_TXN_SECURITY_CTX 0x1000
+#define BINDER_BUFFER_FLAG_HAS_PARENT 0x01
+
+#define TF_ONE_WAY 0x01
+#define TF_ROOT_OBJECT 0x04
+#define TF_STATUS_CODE 0x08
+#define TF_ACCEPT_FDS 0x10
+#define TF_CLEAR_BUF 0x20
+#define TF_UPDATE_TXN 0x40
+
+#define BINDER_CURRENT_PROTOCOL_VERSION 8
+
+struct flat_binder_object {
+    uint32_t type, flags;
+    union { uint64_t binder; uint32_t handle; };
+    uint64_t cookie;
+};
+struct binder_fd_object {
+    uint32_t type, pad_flags;
+    union { uint64_t pad_binder; uint32_t fd; };
+    uint64_t cookie;
+};
+struct binder_buffer_object {
+    uint32_t type, flags;
+    uint64_t buffer, length, parent, parent_offset;
+};
+struct binder_fd_array_object {
+    uint32_t type, pad;
+    uint64_t num_fds, parent, parent_offset;
+};
+struct binder_write_read {
+    uint64_t write_size, write_consumed, write_buffer;
+    uint64_t read_size, read_consumed, read_buffer;
+};
+struct binder_version { int32_t protocol_version; };
+struct binder_transaction_data {
+    union { uint32_t handle; uint64_t ptr; } target;
+    uint64_t cookie;
+    uint32_t code, flags;
+    int32_t sender_pid;
+    uint32_t sender_euid;
+    uint64_t data_size, offsets_size;
+    union { struct { uint64_t buffer, offsets; } ptr; uint8_t buf[8]; } data;
+};
+struct binder_transaction_data_secctx { struct binder_transaction_data transaction_data; uint64_t secctx; };
+struct binder_transaction_data_sg { struct binder_transaction_data transaction_data; uint64_t buffers_size; };
+struct binder_ptr_cookie { uint64_t ptr, cookie; };
+struct __attribute__((packed)) binder_handle_cookie { uint32_t handle; uint64_t cookie; };
+struct binder_node_debug_info { uint64_t ptr, cookie; uint32_t has_strong_ref, has_weak_ref; };
+struct binder_node_info_for_ref { uint32_t handle, strong_count, weak_count, reserved1, reserved2, reserved3; };
+struct binder_freeze_info { uint32_t pid, enable, timeout_ms; };
+struct binder_frozen_status_info { uint32_t pid, sync_recv, async_recv; };
+struct binder_extended_error { uint32_t id, command; int32_t param; };
+_Static_assert(sizeof(struct binder_transaction_data) == 64, "binder_transaction_data");
+_Static_assert(sizeof(struct binder_handle_cookie) == 12, "binder_handle_cookie");
+_Static_assert(sizeof(struct binder_buffer_object) == 40, "binder_buffer_object");
+_Static_assert(sizeof(struct binder_fd_array_object) == 32, "binder_fd_array_object");
+
+#define BINDER_WRITE_READ LINUX_IOWR('b', 1, sizeof(struct binder_write_read))
+#define BINDER_SET_IDLE_TIMEOUT LINUX_IOW('b', 3, 8)
+#define BINDER_SET_MAX_THREADS LINUX_IOW('b', 5, 4)
+#define BINDER_SET_IDLE_PRIORITY LINUX_IOW('b', 6, 4)
+#define BINDER_SET_CONTEXT_MGR LINUX_IOW('b', 7, 4)
+#define BINDER_THREAD_EXIT LINUX_IOW('b', 8, 4)
+#define BINDER_VERSION LINUX_IOWR('b', 9, sizeof(struct binder_version))
+#define BINDER_GET_NODE_DEBUG_INFO LINUX_IOWR('b', 11, sizeof(struct binder_node_debug_info))
+#define BINDER_GET_NODE_INFO_FOR_REF LINUX_IOWR('b', 12, sizeof(struct binder_node_info_for_ref))
+#define BINDER_SET_CONTEXT_MGR_EXT LINUX_IOW('b', 13, sizeof(struct flat_binder_object))
+#define BINDER_FREEZE LINUX_IOW('b', 14, sizeof(struct binder_freeze_info))
+#define BINDER_GET_FROZEN_INFO LINUX_IOWR('b', 15, sizeof(struct binder_frozen_status_info))
+#define BINDER_ENABLE_ONEWAY_SPAM_DETECTION LINUX_IOW('b', 16, 4)
+#define BINDER_GET_EXTENDED_ERROR LINUX_IOWR('b', 17, sizeof(struct binder_extended_error))
+
+#define BC_TRANSACTION LINUX_IOW('c', 0, sizeof(struct binder_transaction_data))
+#define BC_REPLY LINUX_IOW('c', 1, sizeof(struct binder_transaction_data))
+#define BC_ACQUIRE_RESULT LINUX_IOW('c', 2, 4)
+#define BC_FREE_BUFFER LINUX_IOW('c', 3, 8)
+#define BC_INCREFS LINUX_IOW('c', 4, 4)
+#define BC_ACQUIRE LINUX_IOW('c', 5, 4)
+#define BC_RELEASE LINUX_IOW('c', 6, 4)
+#define BC_DECREFS LINUX_IOW('c', 7, 4)
+#define BC_INCREFS_DONE LINUX_IOW('c', 8, sizeof(struct binder_ptr_cookie))
+#define BC_ACQUIRE_DONE LINUX_IOW('c', 9, sizeof(struct binder_ptr_cookie))
+#define BC_ATTEMPT_ACQUIRE LINUX_IOW('c', 10, 8)
+#define BC_REGISTER_LOOPER LINUX_IO('c', 11)
+#define BC_ENTER_LOOPER LINUX_IO('c', 12)
+#define BC_EXIT_LOOPER LINUX_IO('c', 13)
+#define BC_REQUEST_DEATH_NOTIFICATION LINUX_IOW('c', 14, sizeof(struct binder_handle_cookie))
+#define BC_CLEAR_DEATH_NOTIFICATION LINUX_IOW('c', 15, sizeof(struct binder_handle_cookie))
+#define BC_DEAD_BINDER_DONE LINUX_IOW('c', 16, 8)
+#define BC_TRANSACTION_SG LINUX_IOW('c', 17, sizeof(struct binder_transaction_data_sg))
+#define BC_REPLY_SG LINUX_IOW('c', 18, sizeof(struct binder_transaction_data_sg))
+#define BC_REQUEST_FREEZE_NOTIFICATION LINUX_IOW('c', 19, sizeof(struct binder_handle_cookie))
+#define BC_CLEAR_FREEZE_NOTIFICATION LINUX_IOW('c', 20, sizeof(struct binder_handle_cookie))
+#define BC_FREEZE_NOTIFICATION_DONE LINUX_IOW('c', 21, 8)
+
+#define BR_ERROR LINUX_IOR('r', 0, 4)
+#define BR_OK LINUX_IO('r', 1)
+#define BR_TRANSACTION_SEC_CTX LINUX_IOR('r', 2, sizeof(struct binder_transaction_data_secctx))
+#define BR_TRANSACTION LINUX_IOR('r', 2, sizeof(struct binder_transaction_data))
+#define BR_REPLY LINUX_IOR('r', 3, sizeof(struct binder_transaction_data))
+#define BR_DEAD_REPLY LINUX_IO('r', 5)
+#define BR_TRANSACTION_COMPLETE LINUX_IO('r', 6)
+#define BR_INCREFS LINUX_IOR('r', 7, sizeof(struct binder_ptr_cookie))
+#define BR_ACQUIRE LINUX_IOR('r', 8, sizeof(struct binder_ptr_cookie))
+#define BR_RELEASE LINUX_IOR('r', 9, sizeof(struct binder_ptr_cookie))
+#define BR_DECREFS LINUX_IOR('r', 10, sizeof(struct binder_ptr_cookie))
+#define BR_NOOP LINUX_IO('r', 12)
+#define BR_SPAWN_LOOPER LINUX_IO('r', 13)
+#define BR_DEAD_BINDER LINUX_IOR('r', 15, 8)
+#define BR_CLEAR_DEATH_NOTIFICATION_DONE LINUX_IOR('r', 16, 8)
+#define BR_FAILED_REPLY LINUX_IO('r', 17)
+#define BR_FROZEN_REPLY LINUX_IO('r', 18)
+#define BR_ONEWAY_SPAM_SUSPECT LINUX_IO('r', 19)
