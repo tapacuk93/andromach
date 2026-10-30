@@ -21,6 +21,8 @@ const char *am_datadir;
 int am_strace;
 bool am_deny_exec;
 long am_errno(int e) { return -(long)e; }
+long am_procfs_open(const char *canon, int lflags, am_file **out) { return -2; }
+void am_event_file_gone(am_file *f) {}
 
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); abort(); } } while (0)
 
