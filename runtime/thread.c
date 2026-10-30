@@ -11,17 +11,10 @@
 #include <time.h>
 #include <unistd.h>
 
-static int next_tid = 1000;
+static int next_tid = 1000;  // pids and tids share one space, as on Linux
 
 int am_new_tid(void) { return __atomic_add_fetch(&next_tid, 1, __ATOMIC_RELAXED); }
 
-am_thread *am_thread_new(am_proc *p, int tid) {
-    am_thread *t = calloc(1, sizeof *t);
-    t->proc = p;
-    t->tid = tid;
-    t->altstack[1] = 2;  // SS_DISABLE
-    return t;
-}
 
 // ---- futex -------------------------------------------------------------------------------
 static uint64_t now_ns(int clock) {
@@ -52,11 +45,17 @@ static long futex_wait(uint32_t *addr, uint32_t val, const struct linux_timespec
     return 0;
 }
 
-static long futex_wake(uint32_t *addr, int n) {
+long am_futex_wake(uint32_t *addr, int n) {
     if (n <= 0) return 0;
     int r = n == 1 ? os_sync_wake_by_address_any(addr, 4, OS_SYNC_WAKE_BY_ADDRESS_NONE)
                    : os_sync_wake_by_address_all(addr, 4, OS_SYNC_WAKE_BY_ADDRESS_NONE);
     return r == 0 ? 1 : 0;  // the number woken is not reported; callers only test for > 0
+}
+
+long am_futex_wait_interruptible(uint32_t *addr, uint32_t val) {
+    // Bounded, so a kick that lands just before the wait cannot strand the thread.
+    struct linux_timespec ts = {0, 50 * 1000000};
+    return futex_wait(addr, val, &ts, false, false);
 }
 
 #define FUTEX_WAITERS 0x80000000u
@@ -92,13 +91,13 @@ static long sys_futex(uint32_t *addr, int op, uint32_t val, uint64_t arg4, uint3
     switch (op & 0x7F) {
     case LINUX_FUTEX_WAIT: return futex_wait(addr, val, ts, false, false);
     case LINUX_FUTEX_WAIT_BITSET: return futex_wait(addr, val, ts, true, realtime);
-    case LINUX_FUTEX_WAKE: case LINUX_FUTEX_WAKE_BITSET: return futex_wake(addr, (int)val);
+    case LINUX_FUTEX_WAKE: case LINUX_FUTEX_WAKE_BITSET: return am_futex_wake(addr, (int)val);
     case LINUX_FUTEX_REQUEUE: case LINUX_FUTEX_CMP_REQUEUE:
         if ((op & 0x7F) == LINUX_FUTEX_CMP_REQUEUE && __atomic_load_n(addr, __ATOMIC_SEQ_CST) != val3)
             return AM_ERR(LINUX_EAGAIN);
         // Waking everyone is a valid (spurious-wakeup) implementation of requeue.
-        futex_wake(addr, 0x7FFFFFFF);
-        futex_wake(addr2, 0x7FFFFFFF);
+        am_futex_wake(addr, 0x7FFFFFFF);
+        am_futex_wake(addr2, 0x7FFFFFFF);
         return 1;
     case LINUX_FUTEX_WAKE_OP: {
         // *addr2 = op(*addr2, oparg); wake addr; if cmp(old, cmparg) wake addr2.
@@ -115,7 +114,7 @@ static long sys_futex(uint32_t *addr, int op, uint32_t val, uint64_t arg4, uint3
             default: nv = old ^ oparg; break;
             }
         } while (!__atomic_compare_exchange_n(addr2, &old, nv, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST));
-        long n = futex_wake(addr, (int)val);
+        long n = am_futex_wake(addr, (int)val);
         bool hit;
         switch (cmp) {
         case 0: hit = (int)old == cmparg; break;
@@ -125,7 +124,7 @@ static long sys_futex(uint32_t *addr, int op, uint32_t val, uint64_t arg4, uint3
         case 4: hit = (int)old > cmparg; break;
         default: hit = (int)old >= cmparg; break;
         }
-        if (hit) n += futex_wake(addr2, (int)arg4);
+        if (hit) n += am_futex_wake(addr2, (int)arg4);
         return n;
     }
     case LINUX_FUTEX_LOCK_PI: return futex_lock_pi(addr, ts);
@@ -141,7 +140,48 @@ static long sys_futex(uint32_t *addr, int op, uint32_t val, uint64_t arg4, uint3
 }
 
 // ---- threads -----------------------------------------------------------------------------
-static int live_threads = 1;
+#define HOST_STACK (128 * 1024)
+
+am_thread *am_thread_new(am_proc *p, int tid) {
+    am_thread *t = calloc(1, sizeof *t);
+    t->proc = p;
+    t->tid = tid;
+    t->altstack[1] = 2;  // SS_DISABLE
+    t->host_stack = malloc(HOST_STACK);
+    t->host_stack_top = (void *)(((uintptr_t)t->host_stack + HOST_STACK) & ~15ul);
+    pthread_mutex_lock(&p->lock);
+    t->next = p->threads;
+    p->threads = t;
+    p->nthreads++;
+    pthread_mutex_unlock(&p->lock);
+    return t;
+}
+
+// Unlinks t from its process; returns how many threads the process has left.
+static int thread_unlink(am_thread *t) {
+    am_proc *p = t->proc;
+    pthread_mutex_lock(&p->lock);
+    for (am_thread **pp = &p->threads; *pp; pp = &(*pp)->next)
+        if (*pp == t) { *pp = t->next; break; }
+    int left = --p->nthreads;
+    pthread_mutex_unlock(&p->lock);
+    return left;
+}
+
+void am_thread_free(am_thread *t) {
+    // The host stack may be the one we are running on; it is leaked rather than freed under us.
+    free(t);
+}
+
+// Switches the calling thread to its host stack and runs fn there. For leaving a guest stack
+// that is about to be unmapped or restored (thread exit, exec, the end of a fork child).
+void am_run_on_host_stack(void (*fn)(void *), void *arg) {
+    am_ctx c = {0};
+    c.x[0] = (uint64_t)arg;
+    c.sp = (uint64_t)am_self->host_stack_top;
+    c.pc = (uint64_t)fn;
+    am_resume(&c);
+}
 
 typedef struct { am_thread *t; am_ctx ctx; uint64_t tls; } start_arg;
 
@@ -149,64 +189,64 @@ static void *thread_main(void *arg) {
     start_arg a = *(start_arg *)arg;
     free(arg);
     am_self = a.t;
-    char here;
-    a.t->host_stack_top = (void *)(((uintptr_t)&here - 4096) & ~15ul);
     am_thread_tsd_init(a.tls);
     am_resume(&a.ctx);
 }
 
-// Runs on the thread's own host stack, after the guest stack may already be gone.
-static __attribute__((noreturn)) void thread_exit_tail(am_thread *t) {
-    if (t->clear_child_tid) {
-        __atomic_store_n((uint32_t *)t->clear_child_tid, 0, __ATOMIC_SEQ_CST);
-        futex_wake((uint32_t *)t->clear_child_tid, 1);
-    }
-    if (!__atomic_sub_fetch(&live_threads, 1, __ATOMIC_ACQ_REL)) exit(0);
-    am_self = NULL;
-    free(t);
-    pthread_exit(NULL);
-}
-
-static __attribute__((noreturn)) void thread_exit(void) {
-    am_thread *t = am_self;
-    if (!t->host_stack_top) thread_exit_tail(t);  // the first thread: its host stack is separate
-    am_ctx c = {0};
-    c.x[0] = (uint64_t)t;
-    c.sp = (uint64_t)t->host_stack_top;
-    c.pc = (uint64_t)thread_exit_tail;
-    am_resume(&c);
-}
-
-static long sys_clone(am_ctx *c, uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t tls, uint64_t ctid) {
-    if (!(flags & LINUX_CLONE_VM) || !(flags & LINUX_CLONE_THREAD)) {
-        // A new process. Processes as separate guests in this address space come later.
-        return AM_ERR(LINUX_ENOSYS);
-    }
-    int tid = am_new_tid();
-    am_thread *t = am_thread_new(am_self->proc, tid);
-    t->sigmask = am_self->sigmask;
-    if (flags & LINUX_CLONE_CHILD_CLEARTID) t->clear_child_tid = ctid;
-    if (flags & LINUX_CLONE_PARENT_SETTID) *(int *)ptid = tid;
-    if (flags & LINUX_CLONE_CHILD_SETTID) *(int *)ctid = tid;
+// Runs t on a new host thread from register state c, with guest thread pointer tls.
+int am_thread_start(am_thread *t, const am_ctx *c, uint64_t tls) {
     start_arg *a = malloc(sizeof *a);
     a->t = t;
     a->ctx = *c;
-    a->ctx.x[0] = 0;
-    if (newsp) a->ctx.sp = newsp;
-    uint64_t *tsd;
-    __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tsd));
-    a->tls = (flags & LINUX_CLONE_SETTLS) ? tls : tsd[AM_TSD_GUEST_TP];
-    __atomic_add_fetch(&live_threads, 1, __ATOMIC_ACQ_REL);
+    a->tls = tls;
     pthread_attr_t at;
     pthread_attr_init(&at);
     pthread_attr_setstacksize(&at, 256 * 1024);
     pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
     int r = pthread_create(&t->host, &at, thread_main, a);
     pthread_attr_destroy(&at);
-    if (r) {
-        __atomic_sub_fetch(&live_threads, 1, __ATOMIC_ACQ_REL);
-        free(a);
-        free(t);
+    if (r) free(a);
+    return r;
+}
+
+void am_thread_exit_tail(void *arg) {
+    am_thread *t = arg;
+    if (t->clear_child_tid) {
+        __atomic_store_n((uint32_t *)t->clear_child_tid, 0, __ATOMIC_SEQ_CST);
+        am_futex_wake((uint32_t *)t->clear_child_tid, 1);
+    }
+    am_proc *p = t->proc;
+    int left = thread_unlink(t);
+    am_self = NULL;
+    am_thread_free(t);
+    if (!left && !p->exiting) {
+        // The last thread leaving ends the process, with status 0 as Linux does.
+        am_thread tmp = {.proc = p, .tid = p->pid};
+        am_self = &tmp;
+        am_proc_exit(0);
+    }
+    pthread_exit(NULL);
+}
+
+void am_thread_exit(void) {
+    am_run_on_host_stack(am_thread_exit_tail, am_self);
+}
+
+static long sys_clone(am_ctx *c, uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t tls, uint64_t ctid) {
+    int tid = am_new_tid();
+    am_thread *t = am_thread_new(am_self->proc, tid);
+    t->sigmask = am_self->sigmask;
+    if (flags & LINUX_CLONE_CHILD_CLEARTID) t->clear_child_tid = ctid;
+    if (flags & LINUX_CLONE_PARENT_SETTID) *(int *)ptid = tid;
+    if (flags & LINUX_CLONE_CHILD_SETTID) *(int *)ctid = tid;
+    am_ctx child = *c;
+    child.x[0] = 0;
+    if (newsp) child.sp = newsp;
+    uint64_t *tsd;
+    __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tsd));
+    if (am_thread_start(t, &child, (flags & LINUX_CLONE_SETTLS) ? tls : tsd[AM_TSD_GUEST_TP])) {
+        thread_unlink(t);
+        am_thread_free(t);
         return AM_ERR(LINUX_EAGAIN);
     }
     return tid;
@@ -217,13 +257,15 @@ static long sys_clone(am_ctx *c, uint64_t flags, uint64_t newsp, uint64_t ptid, 
 long sys_thread(am_ctx *c, long nr, bool *handled) {
     *handled = true;
     switch (nr) {
-    case LINUX_SYS_clone: return sys_clone(c, A(0), A(1), A(2), A(3), A(4));
+    case LINUX_SYS_clone:
+        if (!(A(0) & LINUX_CLONE_THREAD)) break;  // a new process: proc.c
+        return sys_clone(c, A(0), A(1), A(2), A(3), A(4));
     case LINUX_SYS_clone3: {
         struct { uint64_t flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls; } *a = (void *)A(0);
+        if (!(a->flags & LINUX_CLONE_THREAD)) break;
         return sys_clone(c, a->flags, a->stack ? a->stack + a->stack_size : 0, a->parent_tid, a->tls, a->child_tid);
     }
-    case LINUX_SYS_exit: thread_exit();
-    case LINUX_SYS_exit_group: fflush(NULL); _exit((int)A(0) & 0xFF);
+    case LINUX_SYS_exit: am_thread_exit();
     case LINUX_SYS_futex: return sys_futex((uint32_t *)A(0), (int)A(1), (uint32_t)A(2), A(3), (uint32_t *)A(4), (uint32_t)A(5));
     case LINUX_SYS_set_tid_address: am_self->clear_child_tid = A(0); return am_self->tid;
     case LINUX_SYS_set_robust_list: return 0;

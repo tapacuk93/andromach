@@ -69,8 +69,9 @@ static long load_elf(const char *gpath, loaded *out, char *canon, size_t canonsz
         }
     }
     // PIE and shared objects only: reserve the whole span, then place each segment in it.
-    void *res = mmap(NULL, hi - lo, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (res == MAP_FAILED) { am_file_put(f); return AM_ERR(LINUX_ENOMEM); }
+    long res_r = am_mmap(0, hi - lo, 0, LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS, -1, 0);
+    if (res_r < 0) { am_file_put(f); return AM_ERR(LINUX_ENOMEM); }
+    void *res = (void *)res_r;
     uint64_t bias = (uint64_t)res - lo;
     int fd = am_fd_install(am_self->proc, f, 3, true);
     for (int i = 0; i < eh.e_phnum; i++) {
@@ -130,8 +131,9 @@ long am_exec(am_ctx *c, const char *gpath, char *const argv[], char *const envp[
     snprintf(am_self->proc->exe, sizeof am_self->proc->exe, "%s", canon);
 
     size_t stack_size = 8 << 20;
-    uint8_t *stack = mmap(NULL, stack_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (stack == MAP_FAILED) return AM_ERR(LINUX_ENOMEM);
+    long stack_r = am_mmap(0, stack_size, LINUX_PROT_READ | LINUX_PROT_WRITE, LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS, -1, 0);
+    if (stack_r < 0) return AM_ERR(LINUX_ENOMEM);
+    uint8_t *stack = (uint8_t *)stack_r;
     uint8_t *sp = stack + stack_size;
     int argc = 0, envc = 0;
     while (argv[argc]) argc++;

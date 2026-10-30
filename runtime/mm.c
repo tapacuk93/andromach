@@ -7,16 +7,73 @@
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+
+// ---- the process's ranges ---------------------------------------------------------------
+void am_vma_remove(am_proc *p, uint64_t start, uint64_t end) {
+    pthread_mutex_lock(&p->vm_lock);
+    int out = 0;
+    am_vma *v = p->vmas;
+    am_vma tail = {0};
+    bool split = false;
+    for (int i = 0; i < p->nvma; i++) {
+        am_vma r = v[i];
+        if (r.end <= start || r.start >= end) { v[out++] = r; continue; }
+        if (r.start < start && r.end > end) { tail = (am_vma){end, r.end, r.shared}; split = true; }
+        if (r.start < start) v[out++] = (am_vma){r.start, start, r.shared};
+        else if (r.end > end) v[out++] = (am_vma){end, r.end, r.shared};
+    }
+    p->nvma = out;
+    pthread_mutex_unlock(&p->vm_lock);
+    if (split) am_vma_add(p, tail.start, tail.end, tail.shared);
+}
+
+void am_vma_add(am_proc *p, uint64_t start, uint64_t end, bool shared) {
+    am_vma_remove(p, start, end);
+    pthread_mutex_lock(&p->vm_lock);
+    if (p->nvma == p->vma_cap) {
+        p->vma_cap = p->vma_cap ? p->vma_cap * 2 : 64;
+        p->vmas = realloc(p->vmas, p->vma_cap * sizeof *p->vmas);
+    }
+    int i = p->nvma;
+    while (i > 0 && p->vmas[i - 1].start > start) { p->vmas[i] = p->vmas[i - 1]; i--; }
+    p->vmas[i] = (am_vma){start, end, shared};
+    p->nvma++;
+    pthread_mutex_unlock(&p->vm_lock);
+}
+
+// Releases all of a process's memory; it must not be running on any of it.
+void am_vma_unmap_all(am_proc *p) {
+    pthread_mutex_lock(&p->vm_lock);
+    for (int i = 0; i < p->nvma; i++) munmap((void *)p->vmas[i].start, p->vmas[i].end - p->vmas[i].start);
+    p->nvma = 0;
+    pthread_mutex_unlock(&p->vm_lock);
+}
+
+static long track(long r, uint64_t len, int flags) {
+    if (r >= 0 && am_self) am_vma_add(am_self->proc, r, r + ((len + AM_PAGE - 1) & ~(uint64_t)(AM_PAGE - 1)), flags & LINUX_MAP_SHARED);
+    return r;
+}
 
 static int host_prot(int p) {
     return (p & LINUX_PROT_READ ? PROT_READ : 0) | (p & LINUX_PROT_WRITE ? PROT_WRITE : 0) |
            (p & LINUX_PROT_EXEC ? PROT_EXEC : 0);
 }
 
+static long do_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, uint64_t off);
+
 long am_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, uint64_t off) {
+    long r = do_mmap(addr, len, prot, flags, fd, off);
+    if (getenv("AM_DEBUG") && am_self && am_self->fork)
+        fprintf(stderr, "fork child mmap %#llx+%#llx flags %#x = %#lx\n", (unsigned long long)addr,
+                (unsigned long long)len, flags, r);
+    return track(r, len, flags);
+}
+
+static long do_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, uint64_t off) {
     if (!len) return AM_ERR(LINUX_EINVAL);
     int hflags = (flags & LINUX_MAP_SHARED) ? MAP_SHARED : MAP_PRIVATE;
     bool fixed = flags & LINUX_MAP_FIXED, noreplace = flags & LINUX_MAP_FIXED_NOREPLACE;
@@ -76,13 +133,28 @@ static long dontneed(uint64_t addr, uint64_t len) {
     return 0;
 }
 
+static bool info_private(uint64_t addr) {
+    vm_region_extended_info_data_t info;
+    mach_msg_type_number_t cnt = VM_REGION_EXTENDED_INFO_COUNT;
+    mach_port_t obj;
+    mach_vm_address_t r = addr;
+    mach_vm_size_t sz;
+    if (mach_vm_region(mach_task_self(), &r, &sz, VM_REGION_EXTENDED_INFO, (vm_region_info_t)&info, &cnt, &obj))
+        return true;
+    return info.share_mode != SM_SHARED && info.share_mode != SM_TRUESHARED && info.share_mode != SM_SHARED_ALIASED;
+}
+
 #define A(i) (c->x[i])
 
 long sys_mm(am_ctx *c, long nr, bool *handled) {
     *handled = true;
     switch (nr) {
     case LINUX_SYS_mmap: return am_mmap(A(0), A(1), (int)A(2), (int)A(3), (int)A(4), A(5));
-    case LINUX_SYS_munmap: return munmap((void *)A(0), A(1)) ? am_errno(errno) : 0;
+    case LINUX_SYS_munmap:
+        if (am_self->fork) am_fork_munmap(A(0), A(0) + A(1));
+        else if (munmap((void *)A(0), A(1))) return am_errno(errno);
+        am_vma_remove(am_self->proc, A(0), A(0) + A(1));
+        return 0;
     case LINUX_SYS_mprotect:
         if ((A(2) & LINUX_PROT_EXEC) && am_deny_exec) {
             // Keeping code executable is fine (RELRO, re-protecting mapped segments); making
@@ -103,7 +175,11 @@ long sys_mm(am_ctx *c, long nr, bool *handled) {
     case LINUX_SYS_mremap: {
         uint64_t old = A(0), oldsz = A(1), newsz = A(2), flags = A(3);
         if (newsz <= oldsz) {
-            if (newsz < oldsz) munmap((void *)(old + newsz), oldsz - newsz);
+            if (newsz < oldsz) {
+                if (am_self->fork) am_fork_munmap(old + newsz, old + oldsz);
+                else munmap((void *)(old + newsz), oldsz - newsz);
+                am_vma_remove(am_self->proc, old + newsz, old + oldsz);
+            }
             return old;
         }
         if (!(flags & LINUX_MREMAP_MAYMOVE)) return AM_ERR(LINUX_ENOMEM);
@@ -126,7 +202,10 @@ long sys_mm(am_ctx *c, long nr, bool *handled) {
             munmap((void *)to, oldsz);
             to = b;
         }
-        munmap((void *)old, oldsz);
+        if (am_self->fork) am_fork_munmap(old, old + oldsz);
+        else munmap((void *)old, oldsz);
+        am_vma_remove(am_self->proc, old, old + oldsz);
+        am_vma_add(am_self->proc, to, to + newsz, !(info_private(to)));
         return to;
     }
     case LINUX_SYS_brk: return 0;  // no heap break; bionic allocates with mmap

@@ -59,8 +59,16 @@ _am_syscall_entry:
     add x9, sp, #784
     stp w10, w11, [x9]
 
-    mov x0, sp
+    // The runtime runs on the thread's host stack, never the guest's: guest stacks can be
+    // small (bionic's 16 KiB signal stacks) and the runtime's frames are not.
+    mov x19, sp
+    mrs x9, tpidrro_el0
+    ldr x9, [x9, #(112 * 8)]
+    mov sp, x9
+    mov x0, x19
+    mov x1, #0                      // from a stub, not the trap handler
     bl _am_syscall
+    mov sp, x19
 
     add x9, sp, #272
     ldp q0, q1, [x9, #0]
@@ -105,6 +113,22 @@ _am_syscall_entry:
     add sp, sp, #FRAME
     ret
 
+// am_call_on_host_stack(fn, arg): fn(arg) on the thread's host stack, then back.
+    .p2align 4
+    .globl _am_call_on_host_stack
+_am_call_on_host_stack:
+    stp x19, x30, [sp, #-16]!
+    mov x19, sp
+    mrs x9, tpidrro_el0
+    ldr x9, [x9, #(112 * 8)]
+    mov sp, x9
+    mov x9, x0
+    mov x0, x1
+    blr x9
+    mov sp, x19
+    ldp x19, x30, [sp], #16
+    ret
+
 // am_resume(const am_ctx *): install a complete register state (new thread, signal delivery,
 // rt_sigreturn). Only the kernel can set every register and pc at once, so this traps and the
 // SIGTRAP handler copies the context into the signal frame it returns through.
@@ -113,3 +137,12 @@ _am_syscall_entry:
 _am_resume:
     brk #0xA5FF
     b _am_resume
+
+// Where a guest signal handler returns when it has no SA_RESTORER: arm64 Linux has the
+// equivalent in the vDSO, which andromach does not provide.
+    .p2align 4
+    .globl _am_sigreturn_trampoline
+_am_sigreturn_trampoline:
+    mov x8, #139                    // rt_sigreturn
+    brk #0xA500                     // AM_TRAP_SVC
+    b _am_sigreturn_trampoline

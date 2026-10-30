@@ -139,7 +139,8 @@ int am_resolve(int dirfd, const char *gpath, bool follow, char *host, size_t hos
             ln = strlen(link);
         } else {
             if (host_path(cur, hp, sizeof hp) < 0) {
-                if (last) break;
+                // /proc/<pid> and below exist only as the magic links they lead to.
+                if (last || under(cur, "/proc")) continue;
                 return AM_ERR(LINUX_ENOENT);
             }
             ln = readlink(hp, link, sizeof link - 1);

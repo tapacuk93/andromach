@@ -233,7 +233,9 @@ def macho(payload, name, platform):
 
 
 def is_arm64_elf(data):
-    return data[:4] == b'\x7fELF' and len(data) > 20 and data[4] == 2 and data[18] == 183
+    """An arm64 executable or shared object (kernel modules and object files are left alone)."""
+    return (data[:4] == b'\x7fELF' and len(data) > 20 and data[4] == 2 and data[18] == 183
+            and data[16] in (2, 3))
 
 
 def compile_file(src, dst, platform='ios'):

@@ -37,13 +37,12 @@ int main(int argc, char **argv) {
     }
     if (getenv("AM_STRACE")) am_strace = 1;
 
-    static am_proc proc;
-    pthread_mutex_init(&proc.lock, NULL);
-    proc.pid = am_new_tid();
-    proc.ppid = 1;
-    am_fs_init(&proc);
-    am_self = am_thread_new(&proc, proc.pid);
+    am_proc *proc = am_proc_new(NULL);
+    am_init_pid = proc->pid;
+    am_self = am_thread_new(proc, proc->pid);
+    am_self->host = pthread_self();
     am_trap_init();
+    am_signal_init();
     am_binder_init();
     am_thread_tsd_init(0);
 

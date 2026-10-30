@@ -46,7 +46,6 @@ static int linux_clock(int id) {
 static long sys_misc(am_ctx *c, long nr, bool *handled) {
 #define A(i) (c->x[i])
     *handled = true;
-    am_proc *p = am_self->proc;
     switch (nr) {
     case LINUX_SYS_getuid: case LINUX_SYS_geteuid: case LINUX_SYS_getgid: case LINUX_SYS_getegid:
         return 0;  // the guest runs as root: it is alone in its sandbox
@@ -63,9 +62,6 @@ static long sys_misc(am_ctx *c, long nr, bool *handled) {
         if (data) memset(data, 0xFF, 24);
         return 0;
     }
-    case LINUX_SYS_getpgid: case LINUX_SYS_getsid: return p->pid;
-    case LINUX_SYS_setpgid: return 0;
-    case LINUX_SYS_setsid: return p->pid;
     case LINUX_SYS_uname: {
         struct linux_utsname *u = (void *)A(0);
         memset(u, 0, sizeof *u);
@@ -168,41 +164,6 @@ static long sys_misc(am_ctx *c, long nr, bool *handled) {
     case LINUX_SYS_rseq: return AM_ERR(LINUX_ENOSYS);
     case LINUX_SYS_fadvise64: return 0;
 
-    // Signals: recorded so the guest sees consistent answers. Delivery comes later.
-    case LINUX_SYS_rt_sigaction: {
-        int sig = (int)A(0);
-        if (sig < 1 || sig > 64) return AM_ERR(LINUX_EINVAL);
-        if (A(2)) *(am_sigaction *)A(2) = p->sig[sig];
-        if (A(1)) {
-            if (sig == 9 || sig == 19) return AM_ERR(LINUX_EINVAL);
-            p->sig[sig] = *(am_sigaction *)A(1);
-        }
-        return 0;
-    }
-    case LINUX_SYS_rt_sigprocmask: {
-        uint64_t old = am_self->sigmask;
-        if (A(1)) {
-            uint64_t set = *(uint64_t *)A(1);
-            if (A(0) == 0) am_self->sigmask |= set;
-            else if (A(0) == 1) am_self->sigmask &= ~set;
-            else am_self->sigmask = set;
-            am_self->sigmask &= ~((1ull << 8) | (1ull << 18));  // SIGKILL, SIGSTOP
-        }
-        if (A(2)) *(uint64_t *)A(2) = old;
-        return 0;
-    }
-    case LINUX_SYS_sigaltstack:
-        if (A(1)) memcpy((void *)A(1), am_self->altstack, 24);
-        if (A(0)) memcpy(am_self->altstack, (void *)A(0), 24);
-        return 0;
-    case LINUX_SYS_rt_sigpending: memset((void *)A(0), 0, 8); return 0;
-    case LINUX_SYS_kill: case LINUX_SYS_tgkill: case LINUX_SYS_tkill: {
-        int sig = (int)(nr == LINUX_SYS_tgkill ? A(2) : A(1));
-        if (sig == 0) return 0;
-        fprintf(stderr, "andromach: signal %d sent; delivery is not implemented yet\n", sig);
-        if (sig == 6 || sig == 9 || sig == 15) { fflush(NULL); _exit(128 + sig); }
-        return 0;
-    }
     }
     *handled = false;
     return 0;
@@ -210,6 +171,7 @@ static long sys_misc(am_ctx *c, long nr, bool *handled) {
 }
 
 static const char *const names[] = {
+    [LINUX_SYS_waitid] = "waitid", [LINUX_SYS_rt_sigsuspend] = "rt_sigsuspend", [LINUX_SYS_setpgid] = "setpgid",
 #define N(x) [LINUX_SYS_##x] = #x
     N(getcwd), N(dup), N(dup3), N(fcntl), N(ioctl), N(mkdirat), N(unlinkat), N(symlinkat),
     N(renameat), N(statfs), N(fstatfs), N(ftruncate), N(faccessat), N(chdir), N(fchdir),
@@ -225,10 +187,15 @@ static const char *const names[] = {
 #undef N
 };
 
-void am_syscall(am_ctx *c) {
+void am_syscall(am_ctx *c, int from_trap) {
+    am_thread *t = am_self;
+    t->in_runtime = 1;
     long nr = (long)c->x[8];
     bool handled = false;
-    long r = sys_fs(c, nr, &handled);
+    am_ctx entry_pc_sp = {.pc = c->pc, .sp = c->sp};
+    long r = sys_signal(c, nr, &handled, from_trap);
+    if (!handled) r = sys_proc(c, nr, &handled, from_trap);
+    if (!handled) r = sys_fs(c, nr, &handled);
     if (!handled) r = sys_mm(c, nr, &handled);
     if (!handled) r = sys_thread(c, nr, &handled);
     if (!handled) r = sys_misc(c, nr, &handled);
@@ -252,5 +219,12 @@ void am_syscall(am_ctx *c) {
             fprintf(stderr, "[%d] %s(%#llx, %#llx, %#llx, %#llx) = %#lx\n", am_self->tid, n, (unsigned long long)c->x[0],
                     (unsigned long long)c->x[1], (unsigned long long)c->x[2], (unsigned long long)c->x[3], r);
     }
+    t = am_self;  // fork may have switched threads
     c->x[0] = (uint64_t)r;
+    bool replaced = c->pc != entry_pc_sp.pc || c->sp != entry_pc_sp.sp;  // rt_sigreturn, vfork stack
+    if (am_signal_deliver(c)) replaced = true;
+    t->in_runtime = 0;
+    // A stub returns through its own epilogue, which can only resume where it was called from;
+    // anything else needs the full context switch.
+    if (replaced && !from_trap) am_resume(c);
 }
