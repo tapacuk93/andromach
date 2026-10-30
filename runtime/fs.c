@@ -20,7 +20,7 @@
 // ---- mounts ------------------------------------------------------------------------------
 // Guest directories backed by the writable data directory rather than the read-only root.
 static const char *writable[] = {"/data", "/tmp", "/cache", "/mnt", "/storage", "/data_mirror",
-                                 "/metadata", "/dev/socket", "/dev/__properties__", NULL};
+                                 "/metadata", "/dev/socket", "/dev/__properties__", "/linkerconfig", NULL};
 // Host device nodes the guest may open.
 static const char *devices[] = {"null", "zero", "random", "urandom", "tty", "ptmx", NULL};
 
@@ -177,7 +177,7 @@ void am_fs_init(am_proc *p) {
     // Directories the writable mounts and /dev need on the host.
     char hp[4096];
     const char *dirs[] = {"/data", "/data/local/tmp", "/tmp", "/cache", "/dev", "/dev/socket",
-                          "/dev/__properties__", "/proc", "/sys", NULL};
+                          "/dev/__properties__", "/proc", "/sys", "/linkerconfig", NULL};
     for (const char **d = dirs; *d; d++) {
         snprintf(hp, sizeof hp, "%s%s", am_datadir, *d);
         char *s = hp + strlen(am_datadir);

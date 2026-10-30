@@ -63,6 +63,59 @@ def compile_one(job):
         return dst, None, str(e)
 
 
+def pb_fields(b):
+    """The top-level varint and string fields of a protobuf message: {field: value}."""
+    out, i = {}, 0
+    def varint():
+        nonlocal i
+        v = shift = 0
+        while True:
+            c = b[i]; i += 1
+            v |= (c & 0x7F) << shift; shift += 7
+            if c < 0x80:
+                return v
+    while i < len(b):
+        key = varint()
+        field, wt = key >> 3, key & 7
+        if wt == 0:
+            out[field] = varint()
+        elif wt == 2:
+            n = varint(); out[field] = b[i:i + n]; i += n
+        elif wt == 1:
+            i += 8
+        elif wt == 5:
+            i += 4
+        else:
+            break
+    return out
+
+
+def write_apex_info(src_root, dst_root):
+    """/apex/apex-info-list.xml, which apexd writes at boot and linkerconfig reads. The APEXes
+    are unpacked at build time, so the list is written here."""
+    rows = []
+    apex_dir = os.path.join(src_root, 'apex')
+    for name in sorted(os.listdir(apex_dir)):
+        try:
+            with open(os.path.join(apex_dir, name, 'apex_manifest.pb'), 'rb') as f:
+                m = pb_fields(f.read())
+        except OSError:
+            continue
+        version = m.get(2, 1)
+        original = name.replace('com.android.', 'com.google.android.')
+        for cand in (name, original):
+            path = '/system/apex/%s.apex' % cand
+            if os.path.exists(os.path.join(src_root, 'system/system/apex', cand + '.apex')):
+                break
+        rows.append('    <apex-info moduleName="%s" modulePath="%s" preinstalledModulePath="%s" '
+                    'versionCode="%d" versionName="" isFactory="true" isActive="true" '
+                    'lastUpdateMillis="0" provideSharedApexLibs="false" partition="SYSTEM"/>'
+                    % (name, path, path, version))
+    with open(os.path.join(dst_root, 'apex', 'apex-info-list.xml'), 'w') as f:
+        f.write('<?xml version="1.0" encoding="utf-8"?>\n<apex-info-list>\n%s\n</apex-info-list>\n' % '\n'.join(rows))
+    return len(rows)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('src')
@@ -109,6 +162,7 @@ def main():
             for k, v in stats.items():
                 totals[k] = totals.get(k, 0) + v
     print(f'{len(jobs)} images, {linked} files linked, rewritten: {totals}')
+    print(f'apex-info-list.xml: {write_apex_info(a.src, a.dst)} APEXes')
     for dst, err in failed:
         print(f'  failed: {dst}: {err}', file=sys.stderr)
 
