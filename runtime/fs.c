@@ -161,7 +161,7 @@ int am_resolve(int dirfd, const char *gpath, bool follow, char *host, size_t hos
         } else {
             if (host_path(cur, hp, sizeof hp) < 0) {
                 // /proc/<pid> and below exist only as the magic links they lead to.
-                if (last || under(cur, "/proc")) continue;
+                if (last || under(cur, "/proc") || under(cur, "/sys")) continue;
                 return AM_ERR(LINUX_ENOENT);
             }
             ln = readlink(hp, link, sizeof link - 1);
@@ -842,7 +842,13 @@ long sys_fs(am_ctx *c, long nr, bool *handled) {
     case LINUX_SYS_statfs: case LINUX_SYS_fstatfs: {
         struct statfs s;
         if (nr == LINUX_SYS_statfs) {
-            r = am_resolve(LINUX_AT_FDCWD, STR(0), true, host, sizeof host, NULL, 0);
+            char canon[4096];
+            r = am_resolve(LINUX_AT_FDCWD, STR(0), true, host, sizeof host, canon, sizeof canon);
+            if (under(canon, "/proc") || under(canon, "/sys")) {
+                // Virtual file systems: no host file system behind them, so describe the data dir's.
+                snprintf(host, sizeof host, "%s", am_datadir);
+                r = 0;
+            }
             if (r < 0) return r;
             if (statfs(host, &s)) return am_errno(errno);
         } else {
@@ -851,7 +857,9 @@ long sys_fs(am_ctx *c, long nr, bool *handled) {
         }
         struct linux_statfs *l = (void *)A(1);
         memset(l, 0, sizeof *l);
-        const char *gp = nr == LINUX_SYS_statfs ? STR(0) : f->gpath ? f->gpath : "";
+        char gcanon[4096] = "";
+        if (nr == LINUX_SYS_statfs) am_resolve(LINUX_AT_FDCWD, STR(0), true, NULL, 0, gcanon, sizeof gcanon);
+        const char *gp = nr == LINUX_SYS_statfs ? gcanon : f->gpath ? f->gpath : "";
         l->f_type = under(gp, "/sys/fs/selinux") ? 0xF97CFF8C : under(gp, "/proc") ? 0x9FA0
                   : under(gp, "/sys") ? 0x62656572 : 0xEF53;  // selinuxfs, proc, sysfs, ext4
         l->f_bsize = s.f_bsize; l->f_blocks = s.f_blocks; l->f_bfree = s.f_bfree;

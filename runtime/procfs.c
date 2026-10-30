@@ -205,12 +205,7 @@ static bool sys_file(buf *o, const char *path) {
     }
     if (!strcmp(path, "/sys/fs/selinux/mls")) { putf(o, "1"); return true; }
     if (!strcmp(path, "/sys/fs/selinux/policyvers")) { putf(o, "33"); return true; }
-    if (!strcmp(path, "/sys/fs/selinux/access") || !strcmp(path, "/sys/fs/selinux/context") ||
-        !strcmp(path, "/sys/fs/selinux/create")) {
-        // Written then read by the AVC; "everything allowed" in the kernel's reply format.
-        putf(o, "ffffffff ffffffff 0 ffffffff 1 0");
-        return true;
-    }
+
     if (!strncmp(path, "/sys/devices/system/cpu/", 24)) {
         if (strstr(path, "possible") || strstr(path, "present") || strstr(path, "online")) putf(o, "0-%d\n", ncpu() - 1);
         else putf(o, "0\n");
@@ -319,11 +314,53 @@ static bool open_dir(const char *canon, int lflags, am_file **out, long *err) {
     return true;
 }
 
+// selinuxfs transaction files: libselinux writes a question and reads the answer from the same
+// open file. With one domain for everything, every answer is "allowed" and "u:r:su:s0".
+typedef struct { const char *answer; size_t len; bool asked; size_t pos; } transaction;
+
+static long tx_write(am_file *f, const void *b, size_t n) {
+    transaction *t = f->priv;
+    t->asked = true;
+    t->pos = 0;
+    return n;
+}
+
+static long tx_read(am_file *f, void *b, size_t n) {
+    transaction *t = f->priv;
+    if (!t->asked || t->pos >= t->len) return 0;
+    if (n > t->len - t->pos) n = t->len - t->pos;
+    memcpy(b, t->answer + t->pos, n);
+    t->pos += n;
+    return n;
+}
+
+static void tx_release(am_file *f) { free(f->priv); }
+
+static const am_file_ops tx_ops = {.name = "selinuxfs", .read = tx_read, .write = tx_write, .release = tx_release};
+
+static bool open_transaction(const char *canon, int lflags, am_file **out) {
+    static const char context[] = "u:r:su:s0";
+    static const char access_ok[] = "ffffffff ffffffff 0 ffffffff 1 0";
+    const char *names[] = {"/sys/fs/selinux/create", "/sys/fs/selinux/member", "/sys/fs/selinux/relabel",
+                           "/sys/fs/selinux/user", "/sys/fs/selinux/context", "/sys/fs/selinux/access", NULL};
+    for (int i = 0; names[i]; i++) {
+        if (strcmp(canon, names[i])) continue;
+        transaction *t = calloc(1, sizeof *t);
+        bool access = !strcmp(canon, "/sys/fs/selinux/access");
+        t->answer = access ? access_ok : context;
+        t->len = access ? sizeof access_ok - 1 : sizeof context;
+        *out = am_file_new(-1, lflags, canon, &tx_ops, t);
+        return true;
+    }
+    return false;
+}
+
 static bool under_proc(const char *p) { return !strncmp(p, "/proc", 5) && (!p[5] || p[5] == '/'); }
 
 long am_procfs_open(const char *canon, int lflags, am_file **out) {
     char host[4096];
     long err;
+    if (open_transaction(canon, lflags, out)) return 0;
     if (open_dir(canon, lflags, out, &err)) return err;
     buf o = {0};
     bool found = under_proc(canon) ? proc_file(&o, canon) : sys_file(&o, canon);

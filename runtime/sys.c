@@ -174,7 +174,15 @@ static long sys_misc(am_ctx *c, long nr, bool *handled) {
     case LINUX_SYS_fadvise64: return 0;
     // Extended attributes: only SELinux labels use them, and there is no SELinux policy.
     case 5: case 6: case 7: return 0;                       // setxattr, lsetxattr, fsetxattr
-    case 8: case 9: case 10: return AM_ERR(61);             // getxattr...: ENODATA
+    case 8: case 9: case 10: {                              // getxattr, lgetxattr, fgetxattr
+        // SELinux labels: one for every file, as there is one domain for every process.
+        static const char label[] = "u:object_r:system_file:s0";
+        if (strcmp((const char *)A(1), "security.selinux")) return AM_ERR(61);  // ENODATA
+        if (!A(3)) return sizeof label;
+        if (A(3) < sizeof label) return AM_ERR(LINUX_ERANGE);
+        memcpy((void *)A(2), label, sizeof label);
+        return sizeof label;
+    }
     case 11: case 12: case 13: return 0;                    // listxattr...: none
     case 14: case 15: case 16: return AM_ERR(61);           // removexattr...
     // mount, umount2, pivot_root, swapon: the guest's file system layout is fixed at build time.

@@ -203,6 +203,29 @@ static void exec_tail(void *arg) {
     am_resume(&c);
 }
 
+// Programs whose job the build has already done, or that need what a sandbox cannot give.
+// apexd mounts APEX images through loop devices and dm-verity; the APEXes are unpacked into the
+// root at build time, so it only has to report them active, as the properties init waits for.
+static bool stand_in(const char *path, char ***argv) {
+    char canon[1024];
+    if (am_resolve(LINUX_AT_FDCWD, path, true, NULL, 0, canon, sizeof canon) < 0) return false;
+    const char *script = NULL;
+    if (!strcmp(canon, "/system/bin/apexd")) {
+        bool service = !(*argv)[1];
+        script = service ? "setprop apexd.status activated; setprop apexd.status ready; "
+                           "exec sleep 2147483647"
+                         : "exit 0";  // --bootstrap, --unmount-all, --snapshotde, ...
+    }
+    if (!script) return false;
+    free_strv(*argv);
+    char **nv = calloc(4, sizeof *nv);
+    nv[0] = strdup("/system/bin/sh");
+    nv[1] = strdup("-c");
+    nv[2] = strdup(script);
+    *argv = nv;
+    return true;
+}
+
 static long sys_execve(const char *gpath, char *const *gargv, char *const *genvp) {
     // crash_dump attaches to the crashed process with ptrace, which there is no way to offer;
     // refusing it lets bionic's crash handler fall back to its own short report.
@@ -211,6 +234,10 @@ static long sys_execve(const char *gpath, char *const *gargv, char *const *genvp
     am_proc *p = t->proc;
     char *path = strdup(gpath);
     char **argv = copy_strv(gargv), **envp = copy_strv(genvp);
+    if (stand_in(path, &argv)) {
+        free(path);
+        path = strdup(argv[0]);
+    }
     for (int depth = 0; depth < 4 && script_argv(path, &argv); depth++) {
         free(path);
         path = strdup(argv[0]);
