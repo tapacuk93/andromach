@@ -174,6 +174,20 @@ long sys_mm(am_ctx *c, long nr, bool *handled) {
         return 0;
     case LINUX_SYS_mremap: {
         uint64_t old = A(0), oldsz = A(1), newsz = A(2), flags = A(3);
+        if ((flags & LINUX_MREMAP_FIXED) && newsz <= oldsz) {
+            // Move the pages to the given address, replacing whatever is there (the linker
+            // updates its CFI shadow this way, one prepared page at a time).
+            mach_vm_address_t to = A(4);
+            vm_prot_t cur, max;
+            if (mach_vm_remap(mach_task_self(), &to, newsz, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(), old,
+                              false, &cur, &max, VM_INHERIT_DEFAULT))
+                return AM_ERR(LINUX_ENOMEM);
+            if (am_self->fork) am_fork_munmap(old, old + oldsz);
+            else munmap((void *)old, oldsz);
+            am_vma_remove(am_self->proc, old, old + oldsz);
+            am_vma_add(am_self->proc, to, to + newsz, !info_private(to));
+            return to;
+        }
         if (newsz <= oldsz) {
             if (newsz < oldsz) {
                 if (am_self->fork) am_fork_munmap(old + newsz, old + oldsz);
